@@ -1,0 +1,14 @@
+@import '@razorpay/blade/fonts.css';
+
+html { min-width: 320px; min-height: 100%; background: #f3f6f2; }
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  font-family: 'Inter', sans-serif;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+#root { min-height: 100vh; }
+::selection { color: #fff; background: #087b5b; }
