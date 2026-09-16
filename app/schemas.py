@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Literal
+from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+)
 
 FailureClass = Literal["issuer_down", "insufficient_funds", "network_timeout", "user_cancelled"]
 CustomerSegment = Literal["high_intent_repeat", "price_sensitive", "subscription_churn", "low_intent"]
@@ -25,6 +32,7 @@ DemoExecutionStatus = Literal[
     "executed",
     "not_executed",
 ]
+TelemetryMode = Literal["live", "demo"]
 ScenarioId = Literal[
     "discount_wins_trap",
     "recovery_casino",
@@ -45,7 +53,7 @@ class StrictModel(BaseModel):
 
     @field_validator("*", mode="before")
     @classmethod
-    def _coerce_datetime_fields(cls, value, info):
+    def _coerce_datetime_fields(cls, value: Any, info: ValidationInfo) -> Any:
         field_info = info.field_name
         if field_info is None:
             return value
@@ -62,28 +70,34 @@ class StrictModel(BaseModel):
         return _parse_datetime_value(value)
 
 
-def _parse_datetime_value(value):
+def _parse_datetime_value(value: Any) -> datetime:
     """Coerce webhook timestamps into a safe datetime value."""
+
+    def utcnow_naive() -> datetime:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def timestamp_naive(timestamp: float) -> datetime:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).replace(tzinfo=None)
 
     if isinstance(value, datetime):
         return value
 
     if value is None:
-        return datetime.utcnow()
+        return utcnow_naive()
 
     if isinstance(value, (int, float)):
         numeric_value = float(value)
         if numeric_value > 1_000_000_000_000:
             numeric_value /= 1000.0
         try:
-            return datetime.utcfromtimestamp(numeric_value)
+            return timestamp_naive(numeric_value)
         except (OverflowError, OSError, ValueError):
-            return datetime.utcnow()
+            return utcnow_naive()
 
     if isinstance(value, str):
         candidate = value.strip()
         if not candidate:
-            return datetime.utcnow()
+            return utcnow_naive()
 
         if candidate.endswith("Z"):
             candidate = candidate[:-1] + "+00:00"
@@ -94,20 +108,20 @@ def _parse_datetime_value(value):
             try:
                 numeric_value = float(value)
             except (TypeError, ValueError):
-                return datetime.utcnow()
+                return utcnow_naive()
 
             if numeric_value > 1_000_000_000_000:
                 numeric_value /= 1000.0
             try:
-                return datetime.utcfromtimestamp(numeric_value)
+                return timestamp_naive(numeric_value)
             except (OverflowError, OSError, ValueError):
-                return datetime.utcnow()
+                return utcnow_naive()
 
         if parsed.tzinfo is not None:
             return parsed.astimezone(timezone.utc).replace(tzinfo=None)
         return parsed
 
-    return datetime.utcnow()
+    return utcnow_naive()
 
 
 class RecoveryCaseBase(StrictModel):
@@ -118,6 +132,9 @@ class RecoveryCaseBase(StrictModel):
     case_age_hours: float = 0.0
     attempt_count: int = Field(default=1, ge=1)
     payment_method: str = Field(default="card", min_length=1)
+    error_code: str | None = "NO_ATTEMPT"
+    error_source: str | None = "NO_ATTEMPT"
+    error_reason: str | None = "NO_ATTEMPT"
     failure_class: FailureClass
     customer_segment: CustomerSegment
     event_time: datetime
@@ -134,6 +151,13 @@ class RecoveryCaseBase(StrictModel):
     def normalize_payment_method(cls, value: str) -> str:
         return value.lower()
 
+    @field_validator("error_code", "error_source", "error_reason", mode="before")
+    @classmethod
+    def normalize_failure_telemetry(cls, value: str | None) -> str:
+        if value is None or not str(value).strip():
+            return "NO_ATTEMPT"
+        return str(value).strip()
+
 
 class RecoveryCaseCreate(RecoveryCaseBase):
     case_id: str | None = None
@@ -147,6 +171,9 @@ class RecoveryCaseUpdate(StrictModel):
     case_age_hours: float | None = Field(default=None, ge=0.0)
     attempt_count: int | None = Field(default=None, ge=1)
     payment_method: str | None = Field(default=None, min_length=1)
+    error_code: str | None = None
+    error_source: str | None = None
+    error_reason: str | None = None
     failure_class: FailureClass | None = None
     customer_segment: CustomerSegment | None = None
     event_time: datetime | None = None
@@ -191,6 +218,7 @@ class InterventionBase(StrictModel):
     incentive_amount: float = Field(default=0.0, ge=0)
     channel: InterventionChannel
     status: InterventionStatus
+    allowed_actions_json: str = "[]"
     executed_at: datetime | None = None
 
 
@@ -204,6 +232,7 @@ class InterventionUpdate(StrictModel):
     incentive_amount: float | None = Field(default=None, ge=0)
     channel: InterventionChannel | None = None
     status: InterventionStatus | None = None
+    allowed_actions_json: str | None = None
     executed_at: datetime | None = None
 
 
@@ -328,7 +357,7 @@ class AuditLogRead(AuditLogBase):
 
 class StrictWebhookPayload(StrictModel):
     event: str = Field(min_length=1)
-    payload: dict
+    payload: dict[str, Any]
     created_at: datetime | None = None
 
 
@@ -365,15 +394,15 @@ class MerchantConstraints(StrictModel):
         min_length=1,
         json_schema_extra={"default": [0, 3, 5, 8, 10]},
     )
-    allowed_actions: List[str]
+    allowed_actions: list[str]
     policy_version: str = Field(default="v3.0", min_length=1)
 
     @field_validator("allowed_actions")
     @classmethod
     def allowed_actions_must_be_unique(
         cls,
-        value: List[str],
-    ) -> List[str]:
+        value: list[str],
+    ) -> list[str]:
         if len(value) != len(set(value)):
             raise ValueError("allowed_actions must not contain duplicates")
         return value
@@ -402,14 +431,14 @@ class DecisionEvaluateRequest(RecoveryCaseRead):
     )
 
     merchant_constraints: MerchantConstraints
-    candidate_actions: List[str]
+    candidate_actions: list[str]
 
     @field_validator("candidate_actions")
     @classmethod
     def candidate_actions_must_be_unique(
         cls,
-        value: List[str],
-    ) -> List[str]:
+        value: list[str],
+    ) -> list[str]:
         if len(value) != len(set(value)):
             raise ValueError("candidate_actions must not contain duplicates")
         return value
@@ -420,7 +449,7 @@ class ConfidenceInterval(StrictModel):
 
     lower_bound: float = Field(ge=-1.0, le=1.0)
     upper_bound: float = Field(ge=-1.0, le=1.0)
-    confidence_level: Literal[0.95] = 0.95
+    confidence_level: float = Field(default=0.95, ge=0.95, le=0.95)
 
 
 class DecisionEvaluateResponse(StrictModel):
@@ -452,14 +481,14 @@ class DemoToggleRequest(StrictModel):
     )
     recovery_case: RecoveryCaseRead
     merchant_constraints: MerchantConstraints
-    candidate_actions: List[str]
+    candidate_actions: list[str]
 
     @field_validator("candidate_actions")
     @classmethod
     def demo_actions_must_be_unique(
         cls,
-        value: List[str],
-    ) -> List[str]:
+        value: list[str],
+    ) -> list[str]:
         if len(value) != len(set(value)):
             raise ValueError("candidate_actions must not contain duplicates")
         return value
@@ -493,7 +522,7 @@ class ScenarioPreset(StrictModel):
         lt=100.0,
         description="Maximum discount percentage of the recovery-case amount.",
     )
-    allowed_actions: List[str] = Field(min_length=1)
+    allowed_actions: list[str] = Field(min_length=1)
     customer_segment: CustomerSegment
     failure_class: FailureClass
     payment_method: str = Field(min_length=1)
@@ -647,10 +676,10 @@ class PolicyStateResponse(StrictModel):
 
 class IntakeWebhookResponse(StrictModel):
     case_id: str
-    normalized_case: dict
-    integrity: dict
-    guardrails: dict
-    learner: dict
+    normalized_case: dict[str, Any]
+    integrity: dict[str, Any]
+    guardrails: dict[str, Any]
+    learner: dict[str, Any]
 
 
 class RazorpayWebhookResponse(StrictModel):
@@ -664,6 +693,24 @@ class RazorpayWebhookResponse(StrictModel):
     ] | None = None
     reason: str | None = None
     current_policy_version: str = Field(min_length=1)
+
+
+class LiveWebhookTelemetry(StrictModel):
+    case_id: str = Field(min_length=1)
+    amount: float = Field(ge=0.0)
+    payment_method: str = Field(min_length=1)
+    error_code: str = Field(min_length=1)
+    error_source: str = Field(min_length=1)
+    error_reason: str = Field(min_length=1)
+    received_at: datetime
+
+
+class TelemetryStatusResponse(StrictModel):
+    mode: TelemetryMode
+    live_webhook_active: bool
+    last_verified_webhook_at: datetime | None = None
+    fallback_after_seconds: int = Field(ge=15)
+    latest_live_event: LiveWebhookTelemetry | None = None
 
 
 class HealthResponse(StrictModel):

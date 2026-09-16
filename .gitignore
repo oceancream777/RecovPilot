@@ -16,4 +16,7 @@ __pycache__/
 
 app/artifacts/*.joblib
 app/artifacts/*.tmp
+data/*.jsonl
+.coverage
+htmlcov/
 .DS_Store

@@ -9,7 +9,6 @@ from typing import Any
 
 from app.models import IntegritySignal, RecoveryCase
 
-
 VELOCITY_WATCH_THRESHOLD = 10
 VELOCITY_QUARANTINE_THRESHOLD = 20
 CONCENTRATION_WATCH_THRESHOLD = 6

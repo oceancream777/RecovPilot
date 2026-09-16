@@ -11,6 +11,8 @@ The causal decision API and synthetic scenarios run entirely on a local machine.
 - [Backend Initialization](#backend-initialization)
 - [Frontend Initialization](#frontend-initialization)
 - [Local Demo](#local-demo)
+- [Automatic Live/Demo Switching](#automatic-livedemo-switching)
+- [Cold-Start Training](#cold-start-training)
 - [Razorpay Test Mode](#razorpay-test-mode)
 - [Ngrok Tunnel](#ngrok-tunnel)
 - [n8n Batch Orchestration](#n8n-batch-orchestration)
@@ -24,6 +26,7 @@ The causal decision API and synthetic scenarios run entirely on a local machine.
 | Tool | Version / Requirement | Purpose |
 | --- | --- | --- |
 | **Python** | 3.10+; 3.11 recommended | FastAPI, causal ML, SQLAlchemy, and SQLite state |
+| **Python packages** | Installed from `requirements.txt` | EconML T-Learner, DuckDB JSONL reads, Scikit-Learn, and Razorpay SDK |
 | **Node.js** | 20.19+ or 22.12+ | Required by the repository's Vite 8 frontend |
 | **npm** | Bundled with a supported Node.js release | Frontend dependency and build commands |
 | **Git** | Current stable release | Clone and version-control workflow |
@@ -164,6 +167,67 @@ curl http://127.0.0.1:8000/api/v1/health
 ```
 
 The response reports API, database, and model state. If `model_available` is false, see [Model unavailable](#model-unavailable).
+
+Check the current automatic input source:
+
+```bash
+curl http://127.0.0.1:8000/api/v1/telemetry/status
+```
+
+An untouched local install reports `"mode": "demo"`. After FastAPI receives and verifies a live Razorpay `payment.failed` webhook, it reports `"mode": "live"` until the configured inactivity timeout expires.
+
+## Automatic Live/Demo Switching
+
+The React dashboard selects its data source automatically. It polls `GET /api/v1/telemetry/status` every 15 seconds.
+
+```text
+No recent verified payment.failed webhook
+-> DEMO mode
+-> Five scenario controls and editable synthetic inputs
+
+Signed Razorpay payment.failed webhook received
+-> Signature verified by FastAPI
+-> Amount and failure telemetry persisted as a non-PII live snapshot
+-> LIVE mode
+-> Read-only amount, payment method, error code, source, and reason
+
+No verified event during the inactivity window
+-> DEMO mode restored
+```
+
+The default inactivity window is 300 seconds. Change it in `.env` when testing the transition:
+
+```dotenv
+RAZORPAY_LIVE_WEBHOOK_INACTIVITY_SECONDS=60
+```
+
+Use the signed production receiver for this behavior:
+
+```text
+https://<your-ngrok-domain>/api/v1/webhooks/razorpay
+```
+
+The generic `/api/v1/intake/webhook` route does not activate live mode. This prevents unsigned synthetic or browser requests from being treated as real Razorpay telemetry. Live merchant constraints are read from backend environment variables; demo merchant constraints are sent from the React controls.
+
+## Cold-Start Training
+
+The repository intentionally ignores the local JSONL log and Joblib model artifact. To create a learned model on a fresh clone, run:
+
+```bash
+python scripts/seed_and_train.py
+```
+
+This appends 500 closed, trusted records to `data/webhooks_log.jsonl`, then trains and saves `app/artifacts/causal_models.joblib`. The generated data teaches the causal engine that discounts help insufficient-funds failures but do not help bank downtime failures.
+
+For an isolated demo log and artifact, use separate paths:
+
+```bash
+python scripts/seed_and_train.py \
+  --log-path data/demo_webhooks_log.jsonl \
+  --artifact-path app/artifacts/demo_causal_models.joblib
+```
+
+Do not run the seeder against a live customer telemetry log. It is a local/demo bootstrap utility and appends synthetic labels by design.
 
 ## Frontend Initialization
 
@@ -465,6 +529,14 @@ Run the static-versus-naive-versus-causal benchmark after seeding:
 ```bash
 python scripts/run_benchmark.py
 ```
+
+To create the 500-record cold-start telemetry set and train the EconML artifact:
+
+```bash
+python scripts/seed_and_train.py
+```
+
+Use alternate `--log-path` and `--artifact-path` values for isolated demo experiments. Do not append synthetic records to a live webhook log.
 
 Run frontend checks:
 

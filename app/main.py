@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
-from math import sqrt
+import logging
 import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from math import sqrt
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -18,9 +19,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.baseline_policy import (
+    INCUMBENT_POLICY_VERSION,
     BaselineDecision,
     BaselineTraceStep,
-    INCUMBENT_POLICY_VERSION,
     decide_incumbent_recovery,
     enforce_baseline_action_veto,
     incumbent_capability_coverage,
@@ -37,10 +38,11 @@ from app.guardrails import (
     MERCHANT_ACTION_VETO_REASON,
     apply_guardrails,
     apply_policy_guard,
+    authorized_recovery_actions,
     enforce_merchant_action_veto,
 )
-from app.integrity import evaluate_case_integrity, score_integrity
 from app.intake import normalize_recovery_event
+from app.integrity import evaluate_case_integrity, score_integrity
 from app.learner import (
     MODEL_ARTIFACT_PATH,
     apply_demo_decision_override,
@@ -58,6 +60,7 @@ from app.models import (
     Outcome,
     PolicyVersion,
     RecoveryCase,
+    TelemetryRuntimeState,
 )
 from app.razorpay_client import (
     RazorpayConfigurationError,
@@ -70,9 +73,9 @@ from app.risk_engine import evaluate_execution_risk
 from app.schemas import (
     ApproveLinkRequest,
     ApproveLinkResponse,
-    ConfidenceInterval,
     BatchLearningRequest,
     BatchLearningResponse,
+    ConfidenceInterval,
     DecisionEvaluateRequest,
     DecisionEvaluateResponse,
     DemoToggleMLMetrics,
@@ -80,6 +83,7 @@ from app.schemas import (
     DemoToggleResponse,
     HealthResponse,
     IntakeWebhookResponse,
+    LiveWebhookTelemetry,
     MerchantConstraints,
     PolicyStateResponse,
     RazorpayWebhookResponse,
@@ -87,18 +91,34 @@ from app.schemas import (
     ScenarioCatalogItem,
     ScenarioId,
     ScenarioWarmupResponse,
+    TelemetryStatusResponse,
 )
-
+from app.webhook_log import append_webhook_payload
 
 DEFAULT_POLICY_VERSION = "v3.5"
 CHALLENGER_POLICY_VERSION = "v3.6"
 ACTIVE_POLICY_VERSION = DEFAULT_POLICY_VERSION
 USE_CHALLENGER_MODEL = False
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TELEMETRY_RUNTIME_STATE_ID = "default"
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def _append_webhook_safely(
+    payload: dict[str, Any],
+    normalized_fields: dict[str, Any],
+) -> None:
+    try:
+        await append_webhook_payload(
+            payload,
+            normalized_fields=normalized_fields,
+        )
+    except OSError:
+        logger.exception("Could not append webhook delivery to the JSONL ingest log.")
 
 
 def _project_env(name: str) -> str | None:
@@ -124,6 +144,88 @@ def _env_float(name: str, default: float) -> float:
         return float(raw_value)
     except ValueError as exc:
         raise RuntimeError(f"{name} must be a valid number") from exc
+
+
+def _live_webhook_fallback_seconds() -> int:
+    raw_value = _project_env("RAZORPAY_LIVE_WEBHOOK_INACTIVITY_SECONDS")
+    if raw_value is None:
+        return 300
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "RAZORPAY_LIVE_WEBHOOK_INACTIVITY_SECONDS must be an integer"
+        ) from exc
+    if value < 15:
+        raise RuntimeError(
+            "RAZORPAY_LIVE_WEBHOOK_INACTIVITY_SECONDS must be at least 15"
+        )
+    return value
+
+
+def _to_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _telemetry_status(db: Session) -> TelemetryStatusResponse:
+    fallback_after_seconds = _live_webhook_fallback_seconds()
+    state = db.get(TelemetryRuntimeState, TELEMETRY_RUNTIME_STATE_ID)
+    if state is None or state.last_verified_webhook_at is None:
+        return TelemetryStatusResponse(
+            mode="demo",
+            live_webhook_active=False,
+            fallback_after_seconds=fallback_after_seconds,
+        )
+
+    last_verified = _to_utc(state.last_verified_webhook_at)
+    is_active = (
+        _utcnow() - last_verified
+    ).total_seconds() <= fallback_after_seconds
+    latest_event = None
+    if is_active and state.latest_case_id and state.amount is not None:
+        latest_event = LiveWebhookTelemetry(
+            case_id=state.latest_case_id,
+            amount=state.amount,
+            payment_method=state.payment_method or "unknown",
+            error_code=state.error_code or "UNKNOWN",
+            error_source=state.error_source or "UNKNOWN",
+            error_reason=state.error_reason or "UNKNOWN",
+            received_at=last_verified,
+        )
+
+    return TelemetryStatusResponse(
+        mode="live" if is_active else "demo",
+        live_webhook_active=is_active,
+        last_verified_webhook_at=last_verified,
+        fallback_after_seconds=fallback_after_seconds,
+        latest_live_event=latest_event,
+    )
+
+
+def _record_live_webhook_telemetry(
+    db: Session,
+    *,
+    case_id: str,
+    amount: float,
+    payment_method: str,
+    error_code: str,
+    error_source: str,
+    error_reason: str,
+) -> None:
+    state = db.get(TelemetryRuntimeState, TELEMETRY_RUNTIME_STATE_ID)
+    if state is None:
+        state = TelemetryRuntimeState(state_id=TELEMETRY_RUNTIME_STATE_ID)
+        db.add(state)
+    state.last_verified_webhook_at = _utcnow()
+    state.latest_case_id = case_id
+    state.amount = amount
+    state.payment_method = payment_method
+    state.error_code = error_code
+    state.error_source = error_source
+    state.error_reason = error_reason
+    db.flush()
 
 
 def _live_merchant_constraints() -> MerchantConstraints:
@@ -217,6 +319,32 @@ def _ensure_recovery_case_regulatory_columns() -> None:
                     "ADD COLUMN case_age_hours FLOAT NOT NULL DEFAULT 0.0"
                 )
             )
+        for field in ("error_code", "error_source", "error_reason"):
+            if field not in columns:
+                connection.execute(
+                    text(
+                        f"ALTER TABLE recovery_cases ADD COLUMN {field} "
+                        "VARCHAR NOT NULL DEFAULT 'NO_ATTEMPT'"
+                    )
+                )
+
+
+def _ensure_intervention_authorization_column() -> None:
+    if engine.dialect.name != "sqlite":
+        return
+
+    with engine.begin() as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(text("PRAGMA table_info(interventions)"))
+        }
+        if "allowed_actions_json" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE interventions "
+                    "ADD COLUMN allowed_actions_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            )
 
 
 def _policy_version_defaults(version: str, status_value: str) -> dict[str, Any]:
@@ -287,7 +415,7 @@ def _activate_policy_version(db: Session, version: str) -> str:
     _upsert_policy_version(
         db,
         other_version,
-        "ROLLED_BACK" if version == DEFAULT_POLICY_VERSION else "ROLLED_BACK",
+        "ROLLED_BACK",
     )
     ACTIVE_POLICY_VERSION = version
     USE_CHALLENGER_MODEL = version == CHALLENGER_POLICY_VERSION
@@ -318,6 +446,7 @@ async def lifespan(application: FastAPI):
     """Create persistence and guarantee an in-memory learner before serving."""
     Base.metadata.create_all(bind=engine)
     _ensure_recovery_case_regulatory_columns()
+    _ensure_intervention_authorization_column()
     Path(MODEL_ARTIFACT_PATH).parent.mkdir(parents=True, exist_ok=True)
 
     db = SessionLocal()
@@ -489,6 +618,16 @@ def policy_state(db: Session = Depends(get_db)) -> PolicyStateResponse:
     )
 
 
+@app.get(
+    "/api/v1/telemetry/status",
+    response_model=TelemetryStatusResponse,
+    status_code=status.HTTP_200_OK,
+)
+def telemetry_status(db: Session = Depends(get_db)) -> TelemetryStatusResponse:
+    """Report whether verified Razorpay failure telemetry is currently active."""
+    return _telemetry_status(db)
+
+
 def _upsert_recovery_case(
     db: Session,
     payload: DecisionEvaluateRequest | RecoveryCaseRead,
@@ -505,6 +644,9 @@ def _upsert_recovery_case(
     recovery_case.case_age_hours = payload.case_age_hours
     recovery_case.attempt_count = payload.attempt_count
     recovery_case.payment_method = payload.payment_method
+    recovery_case.error_code = payload.error_code or "NO_ATTEMPT"
+    recovery_case.error_source = payload.error_source or "NO_ATTEMPT"
+    recovery_case.error_reason = payload.error_reason or "NO_ATTEMPT"
     recovery_case.failure_class = payload.failure_class
     recovery_case.customer_segment = payload.customer_segment
     recovery_case.event_time = payload.event_time
@@ -603,6 +745,7 @@ def _safe_untrained_estimate() -> dict[str, Any]:
 def _enforce_final_merchant_action_veto(
     intended_action: str,
     merchant_constraints: MerchantConstraints,
+    candidate_actions: list[str],
     uplift_estimate: dict[str, Any],
     context: dict[str, Any],
 ) -> str:
@@ -612,7 +755,11 @@ def _enforce_final_merchant_action_veto(
     create a new executable action outside the merchant's request. When vetoed,
     rewrite the decision economics to the genuine no-action control values.
     """
-    final_action = enforce_merchant_action_veto(intended_action, merchant_constraints)
+    final_action = enforce_merchant_action_veto(
+        intended_action,
+        merchant_constraints,
+        candidate_actions,
+    )
     if final_action == intended_action:
         return final_action
 
@@ -728,6 +875,11 @@ def evaluate_decision(
         constraints = payload.merchant_constraints.model_dump()
         context: dict[str, Any] = {
             "amount": recovery_case.amount,
+            "case_age_hours": recovery_case.case_age_hours,
+            "merchant_budget": constraints["merchant_budget"],
+            "error_code": recovery_case.error_code,
+            "error_source": recovery_case.error_source,
+            "error_reason": recovery_case.error_reason,
             "failure_class": recovery_case.failure_class,
             "customer_segment": recovery_case.customer_segment,
             "integrity_status": integrity_signal.integrity_status,
@@ -770,6 +922,7 @@ def evaluate_decision(
         final_action = _enforce_final_merchant_action_veto(
             final_action,
             payload.merchant_constraints,
+            payload.candidate_actions,
             uplift_estimate,
             context,
         )
@@ -839,6 +992,12 @@ def execute_demo_toggle(
         recovery_case = _upsert_recovery_case(db, payload.recovery_case)
         scenario_id = payload.scenario_id
         current_policy_version = _current_policy_version(db)
+        authorized_actions = sorted(
+            authorized_recovery_actions(
+                payload.merchant_constraints,
+                payload.candidate_actions,
+            )
+        )
 
         if not payload.agent_enabled:
             demo_override = apply_demo_decision_override(
@@ -882,10 +1041,18 @@ def execute_demo_toggle(
             baseline = enforce_baseline_action_veto(
                 baseline,
                 payload.merchant_constraints,
+                payload.candidate_actions,
             )
             baseline_reason_codes = list(baseline.reason_codes)
             payment_link: dict[str, Any] | None = None
             if baseline.final_action in {"payment_link", "incentive_link"}:
+                authorized_action = enforce_merchant_action_veto(
+                    baseline.final_action,
+                    payload.merchant_constraints,
+                    payload.candidate_actions,
+                )
+                if authorized_action != baseline.final_action:
+                    raise RuntimeError("Final baseline authorization invariant failed.")
                 try:
                     payment_link = create_recovery_payment_link(
                         recovery_case.amount,
@@ -946,6 +1113,7 @@ def execute_demo_toggle(
                         if payment_link or baseline.final_action in {"retry", "message"}
                         else None
                     ),
+                    allowed_actions_json=json.dumps(authorized_actions),
                 )
             )
             db.add(
@@ -1022,6 +1190,11 @@ def execute_demo_toggle(
 
         context: dict[str, Any] = {
             "amount": recovery_case.amount,
+            "case_age_hours": recovery_case.case_age_hours,
+            "merchant_budget": payload.merchant_constraints.merchant_budget,
+            "error_code": recovery_case.error_code,
+            "error_source": recovery_case.error_source,
+            "error_reason": recovery_case.error_reason,
             "failure_class": recovery_case.failure_class,
             "customer_segment": recovery_case.customer_segment,
             "integrity_status": integrity_signal.integrity_status,
@@ -1081,6 +1254,7 @@ def execute_demo_toggle(
         final_action = _enforce_final_merchant_action_veto(
             final_action,
             payload.merchant_constraints,
+            payload.candidate_actions,
             uplift_estimate,
             context,
         )
@@ -1165,6 +1339,13 @@ def execute_demo_toggle(
             and not risk_decision.requires_human_review
         )
         if should_auto_execute:
+            authorized_action = enforce_merchant_action_veto(
+                final_action,
+                payload.merchant_constraints,
+                payload.candidate_actions,
+            )
+            if authorized_action != final_action:
+                raise RuntimeError("Final action authorization invariant failed.")
             payment_link = create_recovery_payment_link(
                 recovery_case.amount,
                 recovery_case.case_id,
@@ -1193,6 +1374,7 @@ def execute_demo_toggle(
                     if final_action in {"no_action", "suppress"}
                     else "pending"
                 ),
+                allowed_actions_json=json.dumps(authorized_actions),
                 executed_at=_utcnow() if payment_link else None,
             )
         )
@@ -1385,6 +1567,23 @@ def approve_recovery_link(
             detail="No pending link approval exists for this case and action.",
         )
 
+    try:
+        allowed_actions = json.loads(intervention.allowed_actions_json or "[]")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The pending decision has an invalid authorization snapshot.",
+        ) from exc
+    if not isinstance(allowed_actions, list) or enforce_merchant_action_veto(
+        payload.approved_action,
+        {"allowed_actions": allowed_actions},
+        allowed_actions,
+    ) != payload.approved_action:
+        raise HTTPException(
+            status_code=409,
+            detail="The approved action is outside the decision's merchant authorization.",
+        )
+
     discount_percentage = 0.0
     if payload.approved_action == "incentive_link":
         if recovery_case.amount <= 0:
@@ -1457,7 +1656,16 @@ async def razorpay_webhook(
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
 
-    if payload.get("event") != "payment.failed":
+    event_name = str(payload.get("event") or "")
+    if event_name != "payment.failed":
+        await _append_webhook_safely(
+            payload,
+            {
+                "record_type": "webhook_received",
+                "event": event_name or "UNKNOWN",
+                "ingested_at": _utcnow(),
+            },
+        )
         return RazorpayWebhookResponse(
             status="ignored",
             reason="unhandled_event",
@@ -1482,6 +1690,35 @@ async def razorpay_webhook(
 
     event_id = request.headers.get("x-razorpay-event-id") or transaction_id
     case_id = str(uuid5(NAMESPACE_URL, f"razorpay-webhook:{event_id}"))
+    error_code = str(payment.get("error_code") or "UNKNOWN")
+    error_source = str(payment.get("error_source") or "UNKNOWN")
+    error_reason = str(payment.get("error_reason") or "UNKNOWN")
+    payment_method = str(payment.get("method") or "card")
+    await _append_webhook_safely(
+        payload,
+        {
+            "record_type": "webhook_received",
+            "event": event_name,
+            "event_id": event_id,
+            "case_id": case_id,
+            "amount": amount,
+            "case_age_hours": 0.0,
+            "error_code": error_code,
+            "error_source": error_source,
+            "error_reason": error_reason,
+            "ingested_at": _utcnow(),
+        },
+    )
+    _record_live_webhook_telemetry(
+        db,
+        case_id=case_id,
+        amount=amount,
+        payment_method=payment_method,
+        error_code=error_code,
+        error_source=error_source,
+        error_reason=error_reason,
+    )
+    db.commit()
     existing_audit = (
         db.query(AuditLog)
         .filter(AuditLog.case_id == case_id)
@@ -1521,8 +1758,16 @@ async def razorpay_webhook(
         amount=amount,
         case_age_hours=0.0,
         attempt_count=1,
-        payment_method=str(payment.get("method") or "card"),
-        failure_class=_map_failure_class("payment_failed", failure_reason),
+        payment_method=payment_method,
+        error_code=error_code,
+        error_source=error_source,
+        error_reason=error_reason,
+        failure_class=_map_failure_class(
+            "payment_failed",
+            failure_reason,
+            error_source=error_source,
+            error_reason=error_reason,
+        ),
         customer_segment=_map_customer_segment("payment_failed", amount),
         event_time=payment.get("created_at"),
         merchant_constraints=constraints,
@@ -1555,12 +1800,30 @@ async def intake_webhook(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    await _append_webhook_safely(
+        raw_payload,
+        {
+            "record_type": "webhook_received",
+            "event": normalized_case["event_type"],
+            "case_id": normalized_case["case_id"],
+            "amount": normalized_case["amount"],
+            "case_age_hours": 0.0,
+            "error_code": normalized_case.get("error_code", "NO_ATTEMPT"),
+            "error_source": normalized_case.get("error_source", "NO_ATTEMPT"),
+            "error_reason": normalized_case.get("error_reason", "NO_ATTEMPT"),
+            "ingested_at": _utcnow(),
+        },
+    )
+
     recovery_case = RecoveryCase(
         case_id=normalized_case["case_id"],
         merchant_id=normalized_case["merchant_id"],
         customer_id=normalized_case["customer_id"],
         transaction_id=normalized_case.get("transaction_id"),
         amount=normalized_case["amount"],
+        error_code=normalized_case.get("error_code", "NO_ATTEMPT"),
+        error_source=normalized_case.get("error_source", "NO_ATTEMPT"),
+        error_reason=normalized_case.get("error_reason", "NO_ATTEMPT"),
         failure_class=_map_failure_class(
             normalized_case["event_type"],
             normalized_case["failure_reason"],
@@ -1594,6 +1857,7 @@ async def intake_webhook(
             incentive_amount=0.0,
             channel="api_retry",
             status="pending",
+            allowed_actions_json="[]",
             executed_at=None,
         )
     )
@@ -1642,7 +1906,7 @@ def health(db: Session = Depends(get_db)) -> HealthResponse:
     try:
         db.execute(text("SELECT 1"))
         database_status = "healthy"
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover
         database_status = f"unhealthy: {exc.__class__.__name__}"
     return HealthResponse(
         api_status="healthy",
@@ -1654,15 +1918,23 @@ def health(db: Session = Depends(get_db)) -> HealthResponse:
     )
 
 
-def _map_failure_class(event_type: str, failure_reason: str) -> str:
+def _map_failure_class(
+    event_type: str,
+    failure_reason: str,
+    *,
+    error_source: str = "",
+    error_reason: str = "",
+) -> str:
     if event_type == "payment_failed":
-        reason = failure_reason.lower()
-        if "issuer" in reason:
-            return "issuer_down"
-        if "fund" in reason:
+        reason = f"{failure_reason} {error_source} {error_reason}".lower()
+        if "insufficient" in reason or "balance" in reason:
             return "insufficient_funds"
-        if "network" in reason:
+        if "issuer" in reason or "bank_down" in reason or "bank_offline" in reason:
+            return "issuer_down"
+        if "network" in reason or "timeout" in reason:
             return "network_timeout"
+        if error_source.lower() == "bank" and "processing_failed" in reason:
+            return "issuer_down"
         return "user_cancelled"
     if event_type == "subscription_halted":
         return "insufficient_funds"

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping, Sequence
-
+from typing import Any
 
 GROUND_TRUTH_PAY_PROBABILITIES: dict[str, dict[str, float]] = {
     "high_intent_repeat": {

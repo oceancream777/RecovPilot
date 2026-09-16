@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from app.models import RecoveryCase
 
-
 HIGH_TICKET_THRESHOLD = 10_000.0
 MERCHANT_BUDGET_CONCENTRATION_RATIO = 0.25
 

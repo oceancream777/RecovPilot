@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import hashlib
 import hmac
 import json
-from pathlib import Path
 import sys
+from copy import deepcopy
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,11 +17,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app import learner, main, razorpay_client, webhook_log
 from app.database import Base
 from app.models import AuditLog, BatchPolicyRun, IntegritySignal, Intervention
 from app.schemas import DemoToggleRequest
-from app import learner, main, razorpay_client
-
 
 EXPECTED_DECISION_KEYS = {
     "recommended_action",
@@ -33,6 +32,15 @@ EXPECTED_DECISION_KEYS = {
     "policy_version",
     "current_policy_version",
 }
+
+DEMO_SCENARIO_IDS = [
+    "discount_wins_trap",
+    "recovery_casino",
+    "policy_rollback",
+    "off_vs_on_casino",
+    "predictive_vs_causal",
+]
+EXECUTABLE_RECOVERY_ACTIONS = ["retry", "payment_link", "incentive_link"]
 
 
 @pytest.fixture()
@@ -60,6 +68,16 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
     monkeypatch.setattr(main, "SessionLocal", testing_session_local)
     monkeypatch.setattr(main, "MODEL_ARTIFACT_PATH", str(artifact_path))
     monkeypatch.setattr(learner, "MODEL_ARTIFACT_PATH", str(artifact_path))
+    webhook_path = tmp_path / "data" / "webhooks_log.jsonl"
+
+    async def append_test_webhook(raw_payload, *, normalized_fields=None):
+        return await webhook_log.append_webhook_payload(
+            raw_payload,
+            normalized_fields=normalized_fields,
+            path=webhook_path,
+        )
+
+    monkeypatch.setattr(main, "append_webhook_payload", append_test_webhook)
     main.app.dependency_overrides[main.get_db] = override_get_db
     with TestClient(main.app) as test_client:
         yield test_client
@@ -1251,6 +1269,209 @@ def test_naive_baseline_fixture_respects_the_final_merchant_action_veto(
     assert "MERCHANT_ACTION_VETO_NO_ACTION" in body["reason_codes"]
 
 
+@pytest.mark.parametrize("scenario", DEMO_SCENARIO_IDS)
+@pytest.mark.parametrize("agent_enabled", [False, True])
+@pytest.mark.parametrize("vetoed_action", EXECUTABLE_RECOVERY_ACTIONS)
+def test_every_scenario_and_mode_respects_each_action_veto(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    agent_enabled: bool,
+    vetoed_action: str,
+) -> None:
+    calls: list[str] = []
+
+    def fake_payment_link(
+        amount: float,
+        case_id: str,
+        action_type: str,
+        discount_percentage: float,
+    ) -> dict:
+        del case_id
+        calls.append(action_type)
+        assert action_type != vetoed_action
+        return {
+            "short_url": "https://rzp.io/i/action-veto-matrix",
+            "final_amount": amount * (1.0 - discount_percentage / 100.0),
+        }
+
+    monkeypatch.setattr(main, "create_recovery_payment_link", fake_payment_link)
+    payload = _demo_payload(agent_enabled=agent_enabled)
+    payload["scenario"] = scenario
+    payload["auto_execute"] = agent_enabled
+    payload["recovery_case"]["case_id"] = (
+        f"mx-{abs(hash(scenario)) % 100000}-{int(agent_enabled)}-"
+        f"{vetoed_action[:3]}"
+    )
+    permitted = [
+        action
+        for action in ["retry", "payment_link", "incentive_link", "no_action"]
+        if action != vetoed_action
+    ]
+    payload["merchant_constraints"]["allowed_actions"] = permitted
+    payload["candidate_actions"] = permitted
+
+    response = client.post("/api/v1/execute/demo_toggle", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["final_action"] != vetoed_action
+    assert vetoed_action not in calls
+
+
+@pytest.mark.parametrize("scenario", DEMO_SCENARIO_IDS)
+def test_on_auto_executes_only_the_policy_selected_permitted_link_action(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    calls: list[tuple[str, float]] = []
+
+    def fake_payment_link(
+        amount: float,
+        case_id: str,
+        action_type: str,
+        discount_percentage: float,
+    ) -> dict:
+        del case_id
+        calls.append((action_type, discount_percentage))
+        return {
+            "short_url": "https://rzp.io/i/action-faithful-auto",
+            "final_amount": amount * (1.0 - discount_percentage / 100.0),
+        }
+
+    monkeypatch.setattr(main, "create_recovery_payment_link", fake_payment_link)
+    payload = _demo_payload(agent_enabled=True)
+    payload["scenario"] = scenario
+    payload["auto_execute"] = True
+    payload["recovery_case"]["case_id"] = f"auto-{abs(hash(scenario)) % 100000}"
+    permitted = ["retry", "payment_link", "incentive_link", "no_action"]
+    payload["merchant_constraints"]["allowed_actions"] = permitted
+    payload["candidate_actions"] = permitted
+
+    response = client.post("/api/v1/execute/demo_toggle", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    final_action = body["final_action"]
+    if final_action in {"payment_link", "incentive_link"}:
+        assert body["status"] == "auto_executed"
+        assert body["short_url"] == "https://rzp.io/i/action-faithful-auto"
+        assert calls == [
+            (
+                final_action,
+                body["ml_metrics"]["recommended_tier"]
+                if final_action == "incentive_link"
+                else 0.0,
+            )
+        ]
+    else:
+        assert body["status"] == "not_executed"
+        assert body["short_url"] is None
+        assert calls == []
+
+
+def test_scenario_override_cannot_bypass_candidate_action_veto(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_payment_link_runs(*_args, **_kwargs) -> dict:
+        raise AssertionError("A candidate-vetoed action must not reach Razorpay")
+
+    monkeypatch.setattr(main, "create_recovery_payment_link", fail_if_payment_link_runs)
+    payload = _demo_payload(agent_enabled=True)
+    payload["scenario"] = "policy_rollback"
+    payload["recovery_case"]["case_id"] = "candidate-veto-rollback"
+    payload["merchant_constraints"]["allowed_actions"] = [
+        "payment_link",
+        "incentive_link",
+        "no_action",
+    ]
+    payload["candidate_actions"] = ["incentive_link", "no_action"]
+
+    response = client.post("/api/v1/execute/demo_toggle", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["final_action"] == "no_action"
+    assert body["short_url"] is None
+    assert "MERCHANT_ACTION_VETO_NO_ACTION" in body["reason_codes"]
+
+
+def test_pending_link_persists_the_candidate_and_merchant_action_intersection(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _demo_payload(agent_enabled=True)
+    payload["recovery_case"]["case_id"] = "case-authorization-snapshot"
+    payload["merchant_constraints"]["allowed_actions"] = [
+        "retry",
+        "payment_link",
+        "incentive_link",
+        "no_action",
+    ]
+    payload["candidate_actions"] = ["incentive_link", "no_action"]
+    monkeypatch.setattr(main, "evaluate_case_integrity", _trusted_signal)
+    monkeypatch.setattr(main, "estimate_uplift", _incentive_recommendation)
+
+    response = client.post("/api/v1/execute/demo_toggle", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "pending_human_review"
+    db = main.SessionLocal()
+    try:
+        intervention = (
+            db.query(Intervention)
+            .filter(Intervention.case_id == payload["recovery_case"]["case_id"])
+            .one()
+        )
+        assert json.loads(intervention.allowed_actions_json) == [
+            "incentive_link",
+            "no_action",
+        ]
+    finally:
+        db.close()
+
+
+def test_approve_link_revalidates_the_persisted_authorization_snapshot(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_payment_link_runs(*_args, **_kwargs) -> dict:
+        raise AssertionError("An unauthorized pending action must not reach Razorpay")
+
+    payload = _demo_payload(agent_enabled=True)
+    payload["recovery_case"]["case_id"] = "case-revalidate-authorization"
+    monkeypatch.setattr(main, "evaluate_case_integrity", _trusted_signal)
+    monkeypatch.setattr(main, "estimate_uplift", _incentive_recommendation)
+    monkeypatch.setattr(main, "create_recovery_payment_link", fail_if_payment_link_runs)
+    evaluation = client.post("/api/v1/execute/demo_toggle", json=payload)
+    assert evaluation.status_code == 200
+
+    db = main.SessionLocal()
+    try:
+        intervention = (
+            db.query(Intervention)
+            .filter(Intervention.case_id == payload["recovery_case"]["case_id"])
+            .one()
+        )
+        intervention.allowed_actions_json = json.dumps(["no_action"])
+        db.commit()
+    finally:
+        db.close()
+
+    approval = client.post(
+        "/api/v1/execute/approve_link",
+        json={
+            "case_id": payload["recovery_case"]["case_id"],
+            "approved_action": "incentive_link",
+        },
+    )
+
+    assert approval.status_code == 409
+    assert "outside the decision's merchant authorization" in approval.json()["detail"]
+
+
 def test_policy_rollback_restores_the_last_known_good_action(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1554,6 +1775,19 @@ def test_live_razorpay_webhook_ignores_authenticated_unhandled_event(
     }
 
 
+def test_telemetry_status_defaults_to_demo(client: TestClient) -> None:
+    response = client.get("/api/v1/telemetry/status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "mode": "demo",
+        "live_webhook_active": False,
+        "last_verified_webhook_at": None,
+        "fallback_after_seconds": 300,
+        "latest_live_event": None,
+    }
+
+
 def test_live_razorpay_webhook_evaluates_paise_payload_once(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1563,11 +1797,18 @@ def test_live_razorpay_webhook_evaluates_paise_payload_once(
     monkeypatch.setattr(main, "evaluate_case_integrity", _trusted_signal)
     monkeypatch.setattr(main, "estimate_uplift", _retry_recommendation)
 
-    captured_amounts: list[float] = []
+    captured_cases: list[tuple[float, str, str, str]] = []
     original_upsert = main._upsert_recovery_case
 
     def capture_upsert(db, payload):
-        captured_amounts.append(payload.amount)
+        captured_cases.append(
+            (
+                payload.amount,
+                payload.error_code,
+                payload.error_source,
+                payload.error_reason,
+            )
+        )
         return original_upsert(db, payload)
 
     monkeypatch.setattr(main, "_upsert_recovery_case", capture_upsert)
@@ -1583,6 +1824,9 @@ def test_live_razorpay_webhook_evaluates_paise_payload_once(
                     "email": "buyer@example.test",
                     "method": "card",
                     "error_description": "network timeout",
+                    "error_code": "GATEWAY_ERROR",
+                    "error_source": "bank",
+                    "error_reason": "payment_processing_failed",
                     "created_at": 1788057529,
                 }
             }
@@ -1610,4 +1854,90 @@ def test_live_razorpay_webhook_evaluates_paise_payload_once(
     }
     assert duplicate.status_code == 200
     assert duplicate.json() == first.json()
-    assert captured_amounts == [4999.0]
+    assert captured_cases == [
+        (
+            4999.0,
+            "GATEWAY_ERROR",
+            "bank",
+            "payment_processing_failed",
+        )
+    ]
+    telemetry = client.get("/api/v1/telemetry/status")
+    assert telemetry.status_code == 200
+    assert telemetry.json()["mode"] == "live"
+    assert telemetry.json()["live_webhook_active"] is True
+    assert telemetry.json()["latest_live_event"] == {
+        "case_id": "2f04e19d-3e79-576f-86c1-9342a319fdf3",
+        "amount": 4999.0,
+        "payment_method": "card",
+        "error_code": "GATEWAY_ERROR",
+        "error_source": "bank",
+        "error_reason": "payment_processing_failed",
+        "received_at": telemetry.json()["last_verified_webhook_at"],
+    }
+
+
+def test_telemetry_status_falls_back_to_demo_after_inactivity(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RAZORPAY_LIVE_WEBHOOK_INACTIVITY_SECONDS", "15")
+    db = main.SessionLocal()
+    try:
+        db.add(
+            main.TelemetryRuntimeState(
+                state_id=main.TELEMETRY_RUNTIME_STATE_ID,
+                last_verified_webhook_at=main._utcnow() - main.timedelta(seconds=16),
+                latest_case_id="case-expired",
+                amount=2500.0,
+                payment_method="upi",
+                error_code="BAD_REQUEST_ERROR",
+                error_source="bank",
+                error_reason="insufficient_funds",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/v1/telemetry/status")
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "demo"
+    assert response.json()["live_webhook_active"] is False
+    assert response.json()["latest_live_event"] is None
+
+
+def test_checkout_abandonment_intake_persists_no_attempt_telemetry(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/api/v1/intake/webhook",
+        json={
+            "event": "checkout.abandoned",
+            "account_id": "merchant-checkout",
+            "payload": {
+                "shop_id": "merchant-checkout",
+                "email": "checkout@example.test",
+                "cart_token": "cart-abandoned-001",
+                "cart_amount": 4999.0,
+                "drop_off_step": "payment_method",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["normalized_case"]["error_code"] == "NO_ATTEMPT"
+    assert body["normalized_case"]["error_source"] == "NO_ATTEMPT"
+    assert body["normalized_case"]["error_reason"] == "NO_ATTEMPT"
+
+    db = main.SessionLocal()
+    try:
+        recovery_case = db.get(main.RecoveryCase, body["case_id"])
+        assert recovery_case is not None
+        assert recovery_case.error_code == "NO_ATTEMPT"
+        assert recovery_case.error_source == "NO_ATTEMPT"
+        assert recovery_case.error_reason == "NO_ATTEMPT"
+    finally:
+        db.close()

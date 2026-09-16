@@ -9,15 +9,17 @@ demo comparison.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from math import log, sqrt
-import os
 from threading import Lock
 from time import perf_counter
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 import pandas as pd
+
 # Avoid a slow physical-core probe in restricted laptop and CI environments.
 if not os.environ.get("LOKY_MAX_CPU_COUNT"):
     os.environ["LOKY_MAX_CPU_COUNT"] = "1"
@@ -29,7 +31,6 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from app.baseline_policy import decide_incumbent_recovery
 from app.learner import MultiTreatmentTLearner
-
 
 DEMO_ACTIONS = ("no_action", "retry", "payment_link", "incentive_link")
 SEGMENTS = (
@@ -238,6 +239,23 @@ TRAP_CURVES: dict[str, dict[str, float]] = {
     },
 }
 
+FAILURE_TELEMETRY: dict[str, tuple[str, str, str]] = {
+    "insufficient_funds": (
+        "BAD_REQUEST_ERROR",
+        "bank",
+        "insufficient_balance",
+    ),
+    "issuer_down": ("SERVER_ERROR", "bank", "bank_offline"),
+    "network_timeout": ("GATEWAY_ERROR", "gateway", "payment_timed_out"),
+    "user_cancelled": ("BAD_REQUEST_ERROR", "customer", "incorrect_otp"),
+}
+SEGMENT_FAILURE_CLASS = {
+    "high_intent_repeat": "issuer_down",
+    "price_sensitive": "user_cancelled",
+    "subscription_churn": "insufficient_funds",
+    "low_intent": "network_timeout",
+}
+
 DRIFT_TRAIN_CURVES: dict[str, dict[str, float]] = {
     **TRAP_CURVES,
     "high_intent_repeat": {
@@ -387,13 +405,10 @@ def _generate_event_stream(definition: ScenarioDefinition) -> pd.DataFrame:
         attempt_count[attack_start:] = 15
         payment_method[attack_start:] = "card"
 
-    failure_by_segment = {
-        "high_intent_repeat": "issuer_down",
-        "price_sensitive": "user_cancelled",
-        "subscription_churn": "insufficient_funds",
-        "low_intent": "network_timeout",
-    }
-    failure_classes = np.asarray([failure_by_segment[str(segment)] for segment in segments])
+    failure_classes = np.asarray(
+        [SEGMENT_FAILURE_CLASS[str(segment)] for segment in segments]
+    )
+    telemetry = [FAILURE_TELEMETRY[str(value)] for value in failure_classes]
     curves = _curves_for(definition)
     probabilities = np.asarray(
         [
@@ -423,8 +438,12 @@ def _generate_event_stream(definition: ScenarioDefinition) -> pd.DataFrame:
             "case_id": [f"{definition.scenario_id}-{index:05d}" for index in range(count)],
             "amount": amounts,
             "failure_class": failure_classes,
+            "error_code": [value[0] for value in telemetry],
+            "error_source": [value[1] for value in telemetry],
+            "error_reason": [value[2] for value in telemetry],
             "customer_segment": segments,
             "case_age_hours": case_age_hours,
+            "merchant_budget": float(definition.preset["merchant_budget"]),
             "attempt_count": attempt_count,
             "payment_method": payment_method,
             "assigned_action": assigned_actions,
@@ -443,6 +462,11 @@ def _train_causal_learner(frame: pd.DataFrame, seed: int) -> MultiTreatmentTLear
     records = frame.rename(columns={"assigned_action": "action"})[
         [
             "amount",
+            "case_age_hours",
+            "merchant_budget",
+            "error_code",
+            "error_source",
+            "error_reason",
             "failure_class",
             "customer_segment",
             "action",
@@ -511,7 +535,31 @@ def estimate_scenario_uplift(
     context: dict[str, Any],
 ) -> dict[str, Any]:
     """Score one interactive case with the selected scenario's trained learner."""
-    return prepare_scenario(scenario_id).learner.estimate_uplift(context)
+    definition = get_scenario_definition(scenario_id)
+    enriched_context = dict(context)
+    scenario_failure = SEGMENT_FAILURE_CLASS.get(
+        str(context.get("customer_segment")),
+        str(context.get("failure_class")),
+    )
+    telemetry = FAILURE_TELEMETRY.get(scenario_failure)
+    if telemetry is not None:
+        for field, value in zip(
+            ("error_code", "error_source", "error_reason"),
+            telemetry,
+            strict=True,
+        ):
+            if enriched_context.get(field) in {None, "", "NO_ATTEMPT"}:
+                enriched_context[field] = value
+    constraints = context.get("merchant_constraints") or {}
+    enriched_context.setdefault(
+        "merchant_budget",
+        float(constraints.get("merchant_budget", 0.0)),
+    )
+    enriched_context.setdefault(
+        "case_age_hours",
+        float(definition.preset["case_age_hours"]),
+    )
+    return prepare_scenario(scenario_id).learner.estimate_uplift(enriched_context)
 
 
 def _constraints_dict(constraints: Any) -> dict[str, Any]:
@@ -526,7 +574,7 @@ def _cohort_agent_policy(
     case_age_hours: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     frame = prepared.frame
-    allowed = set(str(action) for action in constraints.get("allowed_actions", []))
+    allowed = {str(action) for action in constraints.get("allowed_actions", [])}
     allowed &= set(DEMO_ACTIONS)
     allowed.add("no_action")
     if case_age_hours < float(constraints.get("recovery_window_hours", 48.0)):
@@ -544,9 +592,15 @@ def _cohort_agent_policy(
         segment_frame = frame.loc[(frame["customer_segment"] == segment) & ~frame["is_attack"]]
         representative_amount = float(segment_frame["amount"].median())
         failure_class = str(segment_frame["failure_class"].mode().iloc[0])
+        error_code, error_source, error_reason = FAILURE_TELEMETRY[failure_class]
         estimate = prepared.learner.estimate_uplift(
             {
                 "amount": representative_amount,
+                "case_age_hours": case_age_hours,
+                "merchant_budget": float(constraints.get("merchant_budget", 0.0)),
+                "error_code": error_code,
+                "error_source": error_source,
+                "error_reason": error_reason,
                 "failure_class": failure_class,
                 "customer_segment": segment,
                 "integrity_status": "TRUSTED",

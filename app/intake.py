@@ -57,6 +57,9 @@ def _normalize_payment_failed(raw_payload: dict, case_id: str) -> dict:
         "event_type": "payment_failed",
         "amount": amount,
         "failure_reason": _first_non_empty(payment_entity.get("error_description"), payment_entity.get("error_reason"), payment_entity.get("description"), default="payment_failed"),
+        "error_code": _first_non_empty(payment_entity.get("error_code"), default="UNKNOWN"),
+        "error_source": _first_non_empty(payment_entity.get("error_source"), default="UNKNOWN"),
+        "error_reason": _first_non_empty(payment_entity.get("error_reason"), default="UNKNOWN"),
         "channel_preference": _first_non_empty(payment_entity.get("method"), payment_entity.get("wallet"), payment_entity.get("bank"), default="payment_gateway"),
         "status": "proposed",
         "created_at": _utcnow(),
@@ -76,6 +79,9 @@ def _normalize_subscription_halted(raw_payload: dict, case_id: str) -> dict:
         "event_type": "subscription_halted",
         "amount": amount,
         "failure_reason": _first_non_empty(payment_entity.get("error_description"), payment_entity.get("error_reason"), subscription_entity.get("status"), default="subscription_halted"),
+        "error_code": _first_non_empty(payment_entity.get("error_code"), default="NO_ATTEMPT"),
+        "error_source": _first_non_empty(payment_entity.get("error_source"), default="NO_ATTEMPT"),
+        "error_reason": _first_non_empty(payment_entity.get("error_reason"), default="NO_ATTEMPT"),
         "channel_preference": _first_non_empty(payment_entity.get("method"), default="subscription_recurring"),
         "status": "proposed",
         "created_at": _utcnow(),
@@ -114,6 +120,9 @@ def _normalize_checkout_abandoned(raw_payload: dict, case_id: str) -> dict:
         "event_type": "checkout_abandoned",
         "amount": amount,
         "failure_reason": drop_off_step,
+        "error_code": "NO_ATTEMPT",
+        "error_source": "NO_ATTEMPT",
+        "error_reason": "NO_ATTEMPT",
         "channel_preference": _first_non_empty(checkout_payload.get("platform"), default="checkout"),
         "status": "proposed",
         "created_at": _utcnow(),
@@ -140,4 +149,3 @@ def normalize_recovery_event(raw_payload: dict, event_source: str) -> dict:
         return _normalize_checkout_abandoned(raw_payload, case_id)
 
     raise ValueError(f"Unsupported event source: {event_source!r}")
-

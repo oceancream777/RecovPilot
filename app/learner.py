@@ -2,28 +2,41 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-import logging
-import os
 from pathlib import Path
 from typing import Any
 
 if not os.environ.get("LOKY_MAX_CPU_COUNT"):
     os.environ["LOKY_MAX_CPU_COUNT"] = "1"
 
+import duckdb
 import joblib
 import numpy as np
+import pandas as pd
+from econml.metalearners import TLearner
+from sklearn.base import BaseEstimator
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.preprocessing import OrdinalEncoder
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
+from app.webhook_log import WEBHOOK_LOG_PATH
 
 ACTIONS = ("no_action", "retry", "payment_link", "incentive_link", "message")
 TREATMENT_ACTIONS = ACTIONS[1:]
-FEATURE_COLUMNS = ("amount", "failure_class", "customer_segment")
+numeric_features = ["amount", "case_age_hours", "merchant_budget"]
+categorical_features = ["error_code", "error_source", "error_reason"]
+policy_context_features = ["failure_class", "customer_segment"]
+FEATURE_COLUMNS = (
+    *numeric_features,
+    *categorical_features,
+    *policy_context_features,
+)
 REQUIRED_SEGMENTS = {
     "high_intent_repeat",
     "price_sensitive",
@@ -222,8 +235,8 @@ class PolicyEstimate:
 
 @dataclass
 class _ActionModel:
-    encoder: ColumnTransformer | None
-    classifier: HistGradientBoostingClassifier | None
+    encoder: Any
+    classifier: Any
     probability: float | None
     samples: int
 
@@ -232,8 +245,36 @@ class _ActionModel:
             return self.probability
         if self.encoder is None or self.classifier is None:
             return None
-        encoded = self.encoder.transform([_feature_row(features)])
+        encoded = self.encoder.transform(_feature_frame([features]))
         return float(self.classifier.predict_proba(encoded)[0, 1])
+
+
+class _PaymentProbabilityModel(BaseEstimator):
+    def __init__(self, max_depth: int = 4, random_state: int = 42) -> None:
+        self.max_depth = max_depth
+        self.random_state = random_state
+
+    def fit(self, features: np.ndarray, outcomes: np.ndarray):
+        labels = np.asarray(outcomes, dtype=int)
+        unique_labels = np.unique(labels)
+        self.constant_probability_: float | None = None
+        self.classifier_: GradientBoostingClassifier | None = None
+        if len(unique_labels) == 1:
+            self.constant_probability_ = float(unique_labels[0])
+            return self
+        self.classifier_ = GradientBoostingClassifier(
+            max_depth=self.max_depth,
+            random_state=self.random_state,
+        )
+        self.classifier_.fit(features, labels)
+        return self
+
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        if self.constant_probability_ is not None:
+            return np.full(len(features), self.constant_probability_, dtype=float)
+        if self.classifier_ is None:
+            raise RuntimeError("Payment probability model has not been fitted.")
+        return self.classifier_.predict_proba(features)[:, 1]
 
 
 def _read(record: Any, name: str, default: Any = None) -> Any:
@@ -242,7 +283,14 @@ def _read(record: Any, name: str, default: Any = None) -> Any:
         return record[name]
     if hasattr(record, name):
         return getattr(record, name)
-    for nested_name in ("case", "assignment", "outcome", "integrity_signal", "integrity"):
+    for nested_name in (
+        "case",
+        "assignment",
+        "outcome",
+        "integrity_signal",
+        "integrity",
+        "merchant_constraints",
+    ):
         nested = (
             record.get(nested_name)
             if isinstance(record, Mapping)
@@ -257,16 +305,64 @@ def _read(record: Any, name: str, default: Any = None) -> Any:
     return default
 
 
-def _feature_row(features: Mapping[str, Any]) -> list[Any]:
+def build_feature_pipeline() -> Pipeline:
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("numeric", StandardScaler(), numeric_features),
+            (
+                "failure_telemetry",
+                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                categorical_features,
+            ),
+            (
+                "policy_context",
+                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                policy_context_features,
+            ),
+        ],
+        remainder="drop",
+        sparse_threshold=0,
+    )
+    return Pipeline([("preprocessor", preprocessor)])
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
     try:
-        amount = float(features.get("amount", 0.0))
+        normalized = float(value) if value is not None else default
     except (TypeError, ValueError):
-        amount = 0.0
-    return [
-        amount,
-        str(features.get("failure_class", "unknown")),
-        str(features.get("customer_segment", "unknown")),
-    ]
+        return default
+    return normalized if np.isfinite(normalized) else default
+
+
+def _as_category(value: Any, default: str) -> str:
+    if value is None:
+        return default
+    missing = pd.isna(value)
+    if isinstance(missing, (bool, np.bool_)) and bool(missing):
+        return default
+    normalized = str(value).strip()
+    return normalized or default
+
+
+def _feature_frame(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
+    normalized = []
+    for row in rows:
+        normalized.append(
+            {
+                "amount": _as_float(row.get("amount")),
+                "case_age_hours": _as_float(row.get("case_age_hours")),
+                "merchant_budget": _as_float(row.get("merchant_budget")),
+                "error_code": _as_category(row.get("error_code"), "NO_ATTEMPT"),
+                "error_source": _as_category(row.get("error_source"), "NO_ATTEMPT"),
+                "error_reason": _as_category(row.get("error_reason"), "NO_ATTEMPT"),
+                "failure_class": _as_category(row.get("failure_class"), "unknown"),
+                "customer_segment": _as_category(
+                    row.get("customer_segment"),
+                    "unknown",
+                ),
+            }
+        )
+    return pd.DataFrame(normalized, columns=FEATURE_COLUMNS)
 
 
 def _record_features(record: Any) -> dict[str, Any]:
@@ -370,17 +466,31 @@ def _tier_probability(
 
 
 class MultiTreatmentTLearner:
-    """One outcome model per assigned action, trained on trusted closed records."""
+    """EconML T-learner adapter preserving the recovery-policy response contract."""
+
+    artifact_version = 2
 
     def __init__(self, random_state: int = 42) -> None:
         self.random_state = random_state
         self.models: dict[str, _ActionModel] = {}
+        self.preprocessor: Pipeline | None = None
+        self.causal_model: TLearner | None = None
+        self.treatment_categories: tuple[str, ...] = ()
 
     @property
     def is_fitted(self) -> bool:
-        return "no_action" in self.models and bool(self.models)
+        has_manual_fixture = (
+            "no_action" in self.models
+            and self.models["no_action"].probability is not None
+        )
+        has_econml_model = (
+            self.preprocessor is not None
+            and self.causal_model is not None
+            and "no_action" in self.treatment_categories
+        )
+        return has_manual_fixture or has_econml_model
 
-    def fit(self, records: Iterable[Any]) -> "MultiTreatmentTLearner":
+    def fit(self, records: Iterable[Any]) -> MultiTreatmentTLearner:
         grouped: dict[str, list[Any]] = {action: [] for action in ACTIONS}
         for record in records:
             action = str(_read(record, "action", ""))
@@ -389,65 +499,112 @@ class MultiTreatmentTLearner:
             if action in grouped and is_closed and integrity_status == "TRUSTED":
                 grouped[action].append(record)
 
-        models: dict[str, _ActionModel] = {}
-        for action, action_records in grouped.items():
-            if not action_records:
-                continue
-            feature_rows = [_feature_row(_record_features(record)) for record in action_records]
-            labels = np.asarray([int(bool(_read(record, "paid", False))) for record in action_records])
-            unique_labels = np.unique(labels)
-
-            if len(unique_labels) == 1:
-                models[action] = _ActionModel(
-                    encoder=None,
-                    classifier=None,
-                    probability=float(unique_labels[0]),
-                    samples=len(action_records),
-                )
-                continue
-
-            encoder = ColumnTransformer(
-                transformers=[
-                    ("amount", "passthrough", [0]),
-                    (
-                        "categories",
-                        OrdinalEncoder(
-                            handle_unknown="use_encoded_value",
-                            unknown_value=-1,
-                        ),
-                        [1, 2],
-                    ),
-                ],
-                sparse_threshold=0,
-            )
-            encoded = encoder.fit_transform(feature_rows)
-            classifier = HistGradientBoostingClassifier(
-                max_iter=200,
-                learning_rate=0.08,
-                max_leaf_nodes=15,
-                l2_regularization=1.0,
-                random_state=self.random_state,
-            )
-            classifier.fit(encoded, labels)
-            models[action] = _ActionModel(
-                encoder=encoder,
-                classifier=classifier,
-                probability=None,
-                samples=len(action_records),
-            )
-
-        if "no_action" not in models:
+        categories = tuple(action for action in ACTIONS if grouped[action])
+        if "no_action" not in categories:
             raise ValueError(
                 "Training requires at least one CLOSED, TRUSTED no_action record for the control model."
             )
-        self.models = models
+        if len(categories) < 2:
+            raise ValueError("Training requires control and at least one treatment action.")
+
+        eligible_records = [record for action in categories for record in grouped[action]]
+        feature_frame = _feature_frame(
+            [_record_features(record) for record in eligible_records]
+        )
+        outcomes = np.asarray(
+            [int(bool(_read(record, "paid", False))) for record in eligible_records],
+            dtype=int,
+        )
+        treatments = np.asarray(
+            [
+                categories.index(str(_read(record, "action", "")))
+                for record in eligible_records
+            ],
+            dtype=int,
+        )
+
+        self.preprocessor = build_feature_pipeline()
+        transformed_features = self.preprocessor.fit_transform(feature_frame)
+        self.causal_model = TLearner(
+            models=_PaymentProbabilityModel(
+                max_depth=4,
+                random_state=self.random_state,
+            ),
+            categories=list(range(len(categories))),
+        )
+        self.causal_model.fit(outcomes, treatments, X=transformed_features)
+        self.treatment_categories = categories
+        self.models = {
+            action: _ActionModel(
+                encoder=None,
+                classifier=None,
+                probability=None,
+                samples=len(grouped[action]),
+            )
+            for action in categories
+        }
         return self
+
+    def _transformed_context(
+        self,
+        context_features: Mapping[str, Any],
+    ) -> np.ndarray | None:
+        if self.preprocessor is None:
+            return None
+        return np.asarray(
+            self.preprocessor.transform(_feature_frame([context_features]))
+        )
+
+    def _predict_probability(
+        self,
+        action: str,
+        context_features: Mapping[str, Any],
+        transformed_features: np.ndarray | None,
+    ) -> float | None:
+        metadata = self.models.get(action)
+        if metadata is None:
+            return None
+        if metadata.probability is not None:
+            return metadata.predict_probability(dict(context_features))
+        if self.causal_model is None or transformed_features is None:
+            return None
+        try:
+            index = self.treatment_categories.index(action)
+        except ValueError:
+            return None
+        prediction = self.causal_model.models[index].predict(transformed_features)
+        return float(np.clip(np.asarray(prediction).reshape(-1)[0], 0.0, 1.0))
+
+    def _predict_lift(
+        self,
+        action: str,
+        baseline: float,
+        probability: float | None,
+        transformed_features: np.ndarray | None,
+    ) -> float | None:
+        if action == "no_action":
+            return 0.0
+        if probability is None:
+            return None
+        if self.causal_model is None or transformed_features is None:
+            return probability - baseline
+        effect = self.causal_model.effect(
+            transformed_features,
+            T0=0,
+            T1=self.treatment_categories.index(action),
+        )
+        return float(np.clip(np.asarray(effect).reshape(-1)[0], -1.0, 1.0))
 
     def estimate_uplift(self, context_features: dict[str, Any]) -> dict[str, Any]:
         if not self.is_fitted:
             raise RuntimeError("Train the T-learner before estimating uplift.")
 
-        baseline = self.models["no_action"].predict_probability(context_features)
+        transformed_features = self._transformed_context(context_features)
+        baseline = self._predict_probability(
+            "no_action",
+            context_features,
+            transformed_features,
+        )
         if baseline is None:
             raise RuntimeError("The control model could not produce a probability.")
 
@@ -465,8 +622,17 @@ class MultiTreatmentTLearner:
         estimates: dict[str, dict[str, Any]] = {}
         for action in ACTIONS:
             model = self.models.get(action)
-            probability = model.predict_probability(context_features) if model else None
-            lift = probability - baseline if probability is not None else None
+            probability = self._predict_probability(
+                action,
+                context_features,
+                transformed_features,
+            )
+            lift = self._predict_lift(
+                action,
+                baseline,
+                probability,
+                transformed_features,
+            )
             cost = _action_cost(action, segment)
             penalty = _expected_abuse_penalty(action, context_features)
             net_revenue = (amount * lift) - cost - penalty if lift is not None else None
@@ -490,7 +656,13 @@ class MultiTreatmentTLearner:
             offer_ladder.insert(0, 0)
         offer_model = self.models.get("incentive_link")
         learned_offer_probability = (
-            offer_model.predict_probability(context_features) if offer_model else None
+            self._predict_probability(
+                "incentive_link",
+                context_features,
+                transformed_features,
+            )
+            if offer_model
+            else None
         )
         tier_estimates: dict[int, dict[str, Any]] = {}
         best_tier = 0
@@ -628,6 +800,96 @@ def train_t_learner(
     return _default_learner
 
 
+def load_training_records_from_jsonl(
+    path: str | Path = WEBHOOK_LOG_PATH,
+) -> list[dict[str, Any]]:
+    source = Path(path)
+    if not source.is_file() or source.stat().st_size == 0:
+        return []
+
+    connection = duckdb.connect(database=":memory:")
+    try:
+        frame = connection.execute(
+            "SELECT * FROM read_ndjson_auto(?, union_by_name = true)",
+            [str(source)],
+        ).fetchdf()
+    finally:
+        connection.close()
+
+    if frame.empty:
+        return []
+
+    records_by_case: dict[str, dict[str, Any]] = {}
+    for index, raw_record in enumerate(frame.to_dict(orient="records")):
+        paid = raw_record.get("paid")
+        if paid is None or bool(pd.isna(paid)):
+            continue
+
+        action_value = raw_record.get("action")
+        if action_value is None or bool(pd.isna(action_value)):
+            incentive_applied = raw_record.get("incentive_applied")
+            if incentive_applied is None or bool(pd.isna(incentive_applied)):
+                continue
+            action_value = "incentive_link" if bool(incentive_applied) else "no_action"
+        action = str(action_value)
+        if action not in ACTIONS:
+            continue
+
+        status_value = raw_record.get("status", "CLOSED")
+        status = "CLOSED" if status_value is None or bool(pd.isna(status_value)) else str(status_value).upper()
+        integrity_value = raw_record.get("integrity_status", "TRUSTED")
+        integrity_status = (
+            "TRUSTED"
+            if integrity_value is None or bool(pd.isna(integrity_value))
+            else str(integrity_value).upper()
+        )
+        if status != "CLOSED" or integrity_status != "TRUSTED":
+            continue
+
+        case_value = raw_record.get("case_id")
+        case_id = (
+            f"jsonl-row-{index}"
+            if case_value is None or bool(pd.isna(case_value))
+            else str(case_value)
+        )
+        records_by_case[case_id] = {
+            "case_id": case_id,
+            "amount": _as_float(raw_record.get("amount")),
+            "case_age_hours": _as_float(raw_record.get("case_age_hours")),
+            "merchant_budget": _as_float(raw_record.get("merchant_budget")),
+            "error_code": _as_category(raw_record.get("error_code"), "NO_ATTEMPT"),
+            "error_source": _as_category(raw_record.get("error_source"), "NO_ATTEMPT"),
+            "error_reason": _as_category(
+                raw_record.get("error_reason"),
+                "NO_ATTEMPT",
+            ),
+            "failure_class": _as_category(
+                raw_record.get("failure_class"),
+                "unknown",
+            ),
+            "customer_segment": _as_category(
+                raw_record.get("customer_segment"),
+                "unknown",
+            ),
+            "action": action,
+            "incentive_applied": action == "incentive_link",
+            "status": status,
+            "paid": bool(paid),
+            "integrity_status": integrity_status,
+        }
+    return list(records_by_case.values())
+
+
+def train_t_learner_from_jsonl(
+    path: str | Path = WEBHOOK_LOG_PATH,
+    random_state: int = 42,
+) -> MultiTreatmentTLearner:
+    records = load_training_records_from_jsonl(path)
+    if not records:
+        raise ValueError("The JSONL log has no CLOSED, TRUSTED attributed outcomes.")
+    return train_t_learner(records, random_state=random_state)
+
+
 def _bootstrap_training_records(db_session: Any) -> list[dict[str, Any]]:
     """Build trusted joined rows while reproducing the benchmark's attack gate."""
     from app.models import Assignment, IntegritySignal, Outcome, RecoveryCase
@@ -673,6 +935,11 @@ def _bootstrap_training_records(db_session: Any) -> list[dict[str, Any]]:
             {
                 "case_id": recovery_case.case_id,
                 "amount": recovery_case.amount,
+                "case_age_hours": recovery_case.case_age_hours,
+                "merchant_budget": 0.0,
+                "error_code": recovery_case.error_code or "NO_ATTEMPT",
+                "error_source": recovery_case.error_source or "NO_ATTEMPT",
+                "error_reason": recovery_case.error_reason or "NO_ATTEMPT",
                 "failure_class": recovery_case.failure_class,
                 "customer_segment": recovery_case.customer_segment,
                 "action": assignment.action,
@@ -693,7 +960,11 @@ def _bootstrap_training_records(db_session: Any) -> list[dict[str, Any]]:
 
 def _load_model_artifact(artifact_path: Path) -> MultiTreatmentTLearner:
     loaded = joblib.load(artifact_path)
-    if not isinstance(loaded, MultiTreatmentTLearner) or not loaded.is_fitted:
+    if (
+        not isinstance(loaded, MultiTreatmentTLearner)
+        or getattr(loaded, "artifact_version", 0) != 2
+        or not loaded.is_fitted
+    ):
         raise ValueError("Artifact is not a fitted MultiTreatmentTLearner.")
     return loaded
 
@@ -708,14 +979,21 @@ def bootstrap_or_load_model(db_session: Any) -> MultiTreatmentTLearner | None:
             _default_learner = _load_model_artifact(artifact_path)
             logger.info("Loaded causal model artifact from %s.", artifact_path)
             return _default_learner
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Model artifact could not be loaded (%s). Rebuilding it from SQLite.",
                 exc,
             )
 
     logger.info("Artifact not found. Auto-training baseline models...")
-    records = _bootstrap_training_records(db_session)
+    jsonl_path = Path(
+        os.environ.get("WEBHOOK_LOG_PATH", str(WEBHOOK_LOG_PATH))
+    )
+    records = load_training_records_from_jsonl(jsonl_path)
+    training_source = "append-only JSONL"
+    if not records:
+        records = _bootstrap_training_records(db_session)
+        training_source = "SQLite attribution state"
     trusted_records = [
         record for record in records if record["integrity_status"] == "TRUSTED"
     ]
@@ -746,9 +1024,10 @@ def bootstrap_or_load_model(db_session: Any) -> MultiTreatmentTLearner | None:
 
     _default_learner = _load_model_artifact(artifact_path)
     logger.info(
-        "Auto-trained and saved causal model artifact to %s using %d trusted records.",
+        "Auto-trained and saved causal model artifact to %s using %d trusted records from %s.",
         artifact_path,
         len(trusted_records),
+        training_source,
     )
     return _default_learner
 
@@ -785,9 +1064,7 @@ def estimate_best_action(case: dict[str, Any]) -> PolicyEstimate:
 def _policy_decision(policy: Any, context: dict[str, Any]) -> tuple[str, float | None]:
     """Return an action and optional predicted lift from common policy interfaces."""
     result: Any
-    if isinstance(policy, MultiTreatmentTLearner):
-        result = policy.estimate_uplift(context)
-    elif hasattr(policy, "estimate_uplift"):
+    if isinstance(policy, MultiTreatmentTLearner) or hasattr(policy, "estimate_uplift"):
         result = policy.estimate_uplift(context)
     elif callable(policy):
         result = policy(context)
@@ -880,13 +1157,18 @@ def evaluate_policy_promotion(
     if ci_lower <= 0:
         return (
             False,
-            "Uncertain uplift: "
-            f"mean={mean_improvement:.4f}, 95% CI=[{ci_lower:.4f}, {ci_upper:.4f}].",
+            (
+                "Uncertain uplift: "
+                f"mean={mean_improvement:.4f}, "
+                f"95% CI=[{ci_lower:.4f}, {ci_upper:.4f}]."
+            ),
         )
     return (
         True,
-        "Promoted: "
-        f"mean lift improvement={mean_improvement:.4f}, "
-        f"95% CI=[{ci_lower:.4f}, {ci_upper:.4f}], "
-        f"max policy delta={max_policy_delta:.1%}.",
+        (
+            "Promoted: "
+            f"mean lift improvement={mean_improvement:.4f}, "
+            f"95% CI=[{ci_lower:.4f}, {ci_upper:.4f}], "
+            f"max policy delta={max_policy_delta:.1%}."
+        ),
     )

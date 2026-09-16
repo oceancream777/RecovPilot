@@ -3,7 +3,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -28,6 +37,27 @@ class RecoveryCase(Base):
         nullable=False,
         default="card",
         server_default="card",
+        index=True,
+    )
+    error_code = Column(
+        String,
+        nullable=False,
+        default="NO_ATTEMPT",
+        server_default="NO_ATTEMPT",
+        index=True,
+    )
+    error_source = Column(
+        String,
+        nullable=False,
+        default="NO_ATTEMPT",
+        server_default="NO_ATTEMPT",
+        index=True,
+    )
+    error_reason = Column(
+        String,
+        nullable=False,
+        default="NO_ATTEMPT",
+        server_default="NO_ATTEMPT",
         index=True,
     )
     failure_class = Column(String, nullable=False, index=True)
@@ -88,6 +118,12 @@ class Intervention(Base):
     incentive_amount = Column(Float, nullable=False, default=0.0)
     channel = Column(String, nullable=False, index=True)
     status = Column(String, nullable=False, index=True)
+    allowed_actions_json = Column(
+        Text,
+        nullable=False,
+        default="[]",
+        server_default="[]",
+    )
     executed_at = Column(DateTime(timezone=True), nullable=True)
 
     case = relationship("RecoveryCase", back_populates="interventions")
@@ -150,6 +186,21 @@ class BatchPolicyRun(Base):
     status = Column(String, nullable=False, index=True)
     rejection_reason = Column(Text, nullable=True)
     metadata_json = Column(Text, nullable=True)
+
+
+class TelemetryRuntimeState(Base):
+    """Persist non-PII live-webhook recency for the dashboard telemetry mode."""
+
+    __tablename__ = "telemetry_runtime_state"
+
+    state_id = Column(String, primary_key=True, default="default")
+    last_verified_webhook_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    latest_case_id = Column(String, nullable=True, index=True)
+    amount = Column(Float, nullable=True)
+    payment_method = Column(String, nullable=True)
+    error_code = Column(String, nullable=True)
+    error_source = Column(String, nullable=True)
+    error_reason = Column(String, nullable=True)
 
 
 class AuditLog(Base):

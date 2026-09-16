@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import logging
 import os
-from pathlib import Path
 import re
+from collections.abc import Mapping
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 import razorpay
-
+from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 client: Any | None = None
@@ -132,14 +131,14 @@ def create_recovery_payment_link(
     final_amount = _money(amount)
     discounted = discount > 0
     if discounted:
-        multiplier = Decimal("1") - (discount / Decimal("100"))
+        multiplier = Decimal(1) - (discount / Decimal(100))
         final_amount = (final_amount * multiplier).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
 
     amount_in_paise = int(
-        (final_amount * Decimal("100")).to_integral_value(rounding=ROUND_HALF_UP)
+        (final_amount * Decimal(100)).to_integral_value(rounding=ROUND_HALF_UP)
     )
     if amount_in_paise < 100:
         raise ValueError("final billed amount must be at least INR 1.00")

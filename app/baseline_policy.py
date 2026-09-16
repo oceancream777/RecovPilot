@@ -7,12 +7,12 @@ conversion data.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from app.guardrails import MERCHANT_ACTION_VETO_REASON, enforce_merchant_action_veto
 from app.models import RecoveryCase
-
 
 RECOVERY_ACTIONS = {
     "no_action",
@@ -106,9 +106,14 @@ def _preferred_fallback(permitted: set[str], *actions: str) -> str:
 def enforce_baseline_action_veto(
     decision: BaselineDecision,
     constraints: Any,
+    candidate_actions: Sequence[str] | None = None,
 ) -> BaselineDecision:
     """Make no_action the only fallback when the merchant vetoes an action."""
-    final_action = enforce_merchant_action_veto(decision.final_action, constraints)
+    final_action = enforce_merchant_action_veto(
+        decision.final_action,
+        constraints,
+        candidate_actions,
+    )
     if final_action == decision.final_action:
         return decision
 
@@ -168,8 +173,8 @@ def decide_incumbent_recovery(
 ) -> BaselineDecision:
     """Select an incumbent action without invoking ML or causal inference."""
     values = _constraint_values(constraints)
-    allowed = set(str(action) for action in values.get("allowed_actions", []))
-    candidates = set(str(action) for action in candidate_actions)
+    allowed = {str(action) for action in values.get("allowed_actions", [])}
+    candidates = {str(action) for action in candidate_actions}
     permitted = (allowed & candidates & RECOVERY_ACTIONS) | {"no_action"}
 
     amount = max(float(_value(case, "amount", 0.0) or 0.0), 0.0)

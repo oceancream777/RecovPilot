@@ -125,6 +125,24 @@ type PolicyStateResponse = {
   latest_run: BatchLearningResponse | null
 }
 
+type LiveWebhookTelemetry = {
+  case_id: string
+  amount: number
+  payment_method: string
+  error_code: string
+  error_source: string
+  error_reason: string
+  received_at: string
+}
+
+type TelemetryStatus = {
+  mode: 'live' | 'demo'
+  live_webhook_active: boolean
+  last_verified_webhook_at: string | null
+  fallback_after_seconds: number
+  latest_live_event: LiveWebhookTelemetry | null
+}
+
 type ExecutionTraceStep = {
   stage: string
   action: string
@@ -225,6 +243,7 @@ const SCENARIO_URL = `${API_ORIGIN}/api/v1/demo/scenarios`
 const HEALTH_URL = `${API_ORIGIN}/api/v1/health`
 const BATCH_LEARNING_URL = `${API_ORIGIN}/api/v1/admin/trigger_batch_learning`
 const POLICY_STATE_URL = `${API_ORIGIN}/api/v1/admin/policy_state`
+const TELEMETRY_STATUS_URL = `${API_ORIGIN}/api/v1/telemetry/status`
 
 const ACTION_OPTIONS = [
   { value: 'retry', label: 'Retry' },
@@ -375,6 +394,7 @@ function RecoveryDashboard() {
   const [activePolicyVersion, setActivePolicyVersion] = useState('v3.5')
   const [latestBatchRun, setLatestBatchRun] = useState<BatchLearningResponse | null>(null)
   const [serviceOnline, setServiceOnline] = useState(false)
+  const [telemetryStatus, setTelemetryStatus] = useState<TelemetryStatus>({ mode: 'demo', live_webhook_active: false, last_verified_webhook_at: null, fallback_after_seconds: 300, latest_live_event: null })
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const toast = useToast()
 
@@ -383,6 +403,8 @@ function RecoveryDashboard() {
   const comparisonReady = pairedRuns.signature === currentSignature && Boolean(pairedRuns.off && pairedRuns.on)
   const comparisonMetrics = pairedRuns.on?.scenario_metrics ?? pairedRuns.off?.scenario_metrics
   const activeAgentResponse = pairedRuns.on ?? (apiResponse?.agent_enabled ? apiResponse : null)
+  const liveTelemetry = telemetryStatus.mode === 'live' ? telemetryStatus.latest_live_event : null
+  const usingLiveTelemetry = Boolean(liveTelemetry)
 
   useEffect(() => {
     let active = true
@@ -395,6 +417,24 @@ function RecoveryDashboard() {
     }
     void initialize()
     return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    const refreshTelemetryStatus = async () => {
+      try {
+        const response = await axios.get<TelemetryStatus>(TELEMETRY_STATUS_URL, { timeout: 8000 })
+        if (active) {
+          setTelemetryStatus(response.data)
+          setServiceOnline(true)
+        }
+      } catch {
+        if (active) setTelemetryStatus((current) => ({ ...current, mode: 'demo', live_webhook_active: false, latest_live_event: null }))
+      }
+    }
+    void refreshTelemetryStatus()
+    const interval = window.setInterval(() => { void refreshTelemetryStatus() }, 15_000)
+    return () => { active = false; window.clearInterval(interval) }
   }, [])
 
   useEffect(() => {
@@ -509,6 +549,12 @@ function RecoveryDashboard() {
 
   const approveOffer = async () => {
     if (!apiResponse || !['payment_link', 'incentive_link'].includes(apiResponse.final_action)) return
+    if (!allowedActions.includes(apiResponse.final_action)) {
+      const message = 'The recommended action is no longer allowed by the merchant controls.'
+      setErrorMessage(message)
+      toast.show({ content: message, color: 'negative', autoDismiss: true })
+      return
+    }
     setIsApprovingOffer(true); setErrorMessage(null)
     try {
       const response = await axios.post<ApproveLinkResponse>(APPROVE_LINK_URL, {
@@ -542,16 +588,17 @@ function RecoveryDashboard() {
     <div className="recovery-shell">
       <aside className="simulator-pane">
         <div className="brand-row"><div className="brand-symbol"><span>R</span></div><div><Text size="small" weight="semibold" color="surface.text.staticWhite.normal">RECOVERY CONTROL</Text><Text size="xsmall" color="surface.text.staticWhite.muted">Active policy · {activePolicyVersion}</Text></div></div>
-        <div className="control-intro"><div className="live-row"><span className={`status-light ${serviceOnline ? 'online' : ''}`} /><span>{serviceOnline ? 'FASTAPI ONLINE' : 'WAITING FOR FASTAPI'}</span></div><Text size="small" color="surface.text.staticWhite.muted">Choose a controlled scene, set merchant vetoes, and replay the same evidence through both systems.</Text></div>
+        <div className="control-intro"><div className="live-row"><span className={`status-light ${serviceOnline ? 'online' : ''}`} /><span>{usingLiveTelemetry ? 'LIVE RAZORPAY TELEMETRY' : serviceOnline ? 'DEMO TELEMETRY READY' : 'WAITING FOR FASTAPI'}</span></div><Text size="small" color="surface.text.staticWhite.muted">{usingLiveTelemetry ? 'A verified payment failure was received. Customer-originated fields are read-only.' : 'No verified payment failure was received recently. The local synthetic simulator is active.'}</Text></div>
 
         <div className="control-form">
-          <div className="scenario-select"><Dropdown selectionType="single"><SelectInput label="Demo scenario" value={selectedScenario} onChange={({ values }) => { const value = values[0] as ScenarioId | undefined; if (value) applyScenario(value) }} /><DropdownOverlay><ActionList>{scenarioCatalog.map((item, index) => <ActionListItem key={item.scenario_id} value={item.scenario_id} title={`${index + 1}. ${item.label}`} description={item.primary_proof} />)}</ActionList></DropdownOverlay></Dropdown></div>
-          <div className={`scenario-card ${isWarming ? 'is-warming' : ''}`}><div className="scenario-card-head"><span>{isWarming ? 'PREPARING' : 'SCENE READY'}</span><Badge color={isWarming ? 'notice' : 'positive'} emphasis="subtle" size="small">{isWarming ? 'WARMING' : warmup?.cache_hit ? 'CACHED' : 'READY'}</Badge></div><strong>{scenario.short_label}</strong><p>{scenario.description}</p><small>Seed {scenario.seed} · {scenario.event_count.toLocaleString('en-IN')} cases · {scenario.attack_count} attacks</small></div>
-          <div className="numeric-grid"><TextInput label="Amount" type="number" prefix="₹" value={String(amount)} onChange={({ value }) => updateNumber(value, setAmount)} /><TextInput label="Case age" type="number" suffix="hours" value={String(caseAgeHours)} onChange={({ value }) => updateNumber(value, setCaseAgeHours)} /><TextInput label="Merchant budget" type="number" prefix="₹" value={String(merchantBudget)} onChange={({ value }) => updateNumber(value, setMerchantBudget)} /><TextInput label="Max incentive" type="number" suffix="%" helpText="Percentage ceiling of amount" value={String(maxIncentive)} onChange={({ value }) => updateNumber(value, setMaxIncentive)} /></div>
-          <div className="action-control"><div><Text size="small" weight="semibold">Allowed actions</Text><Text size="xsmall" color="surface.text.gray.muted">Merchant vetoes are enforced after model scoring.</Text></div><div className="checkbox-grid">{ACTION_OPTIONS.map((action) => <Checkbox key={action.value} value={action.value} isChecked={allowedActions.includes(action.value)} onChange={({ isChecked }) => toggleAction(action.value, isChecked)} size="small">{action.label}</Checkbox>)}</div></div>
-          <div className={`agent-toggle ${agentEnabled ? 'agent-on' : 'agent-off'}`}><div><Text size="small" weight="semibold">Selected single-run mode</Text><Text size="xsmall" color="surface.text.gray.muted">{agentEnabled ? 'ON · causal learner + integrity gate' : 'OFF · incumbent recovery stack'}</Text></div><Switch accessibilityLabel="Toggle recovery agent" isChecked={agentEnabled} onChange={({ isChecked }) => { setAgentEnabled(isChecked); if (comparisonReady) setApiResponse(isChecked ? pairedRuns.on ?? null : pairedRuns.off ?? null); else setApiResponse(null); setOfferApproved(false) }} /></div>
-          <div className={`agent-toggle auto-toggle ${autoExecuteEnabled && agentEnabled ? 'agent-on' : 'agent-off'}`}><div><Text size="small" weight="semibold">ON-AUTO execution</Text><Text size="xsmall" color="surface.text.gray.muted">{autoExecuteEnabled && agentEnabled ? 'Low-risk links execute automatically' : 'Manual approval is the default'}</Text></div><Switch accessibilityLabel="Toggle automatic low-risk execution" isChecked={autoExecuteEnabled && agentEnabled} isDisabled={!agentEnabled} onChange={({ isChecked }) => { setAutoExecuteEnabled(isChecked); resetEvidence() }} /></div>
-          <div className="control-actions"><Button variant="primary" size="large" icon={ZapIcon} isFullWidth isLoading={isPairLoading} isDisabled={isWarming || isLoading} onClick={handlePairedBenchmark}>Execute Paired Benchmark</Button><Button variant="secondary" size="medium" icon={SendIcon} isFullWidth isLoading={isLoading} isDisabled={isWarming || isPairLoading} onClick={handleInjectWebhook}>Run Selected Mode</Button><Button variant="tertiary" size="medium" icon={RefreshIcon} isFullWidth isLoading={isBatchUpdating} onClick={handleBatchLearning}>Trigger Batch Policy Update</Button></div>
+          {usingLiveTelemetry && liveTelemetry ? <div className="live-telemetry-card"><div className="scenario-card-head"><span>VERIFIED LIVE EVENT</span><Badge color="positive" emphasis="subtle" size="small">LIVE</Badge></div><strong>{formatCurrency(liveTelemetry.amount)} · {humanize(liveTelemetry.payment_method)}</strong><div className="live-telemetry-grid"><span>Error code <b>{liveTelemetry.error_code}</b></span><span>Source <b>{liveTelemetry.error_source}</b></span><span>Reason <b>{humanize(liveTelemetry.error_reason)}</b></span><span>Received <b>{new Date(liveTelemetry.received_at).toLocaleTimeString('en-IN')}</b></span></div><small>Live merchant constraints are loaded from the backend environment. Demo controls return after {telemetryStatus.fallback_after_seconds}s without a verified payment failure.</small></div> : <><div className="scenario-select"><Dropdown selectionType="single"><SelectInput label="Demo scenario" value={selectedScenario} onChange={({ values }) => { const value = values[0] as ScenarioId | undefined; if (value) applyScenario(value) }} /><DropdownOverlay><ActionList>{scenarioCatalog.map((item, index) => <ActionListItem key={item.scenario_id} value={item.scenario_id} title={`${index + 1}. ${item.label}`} description={item.primary_proof} />)}</ActionList></DropdownOverlay></Dropdown></div>
+            <div className={`scenario-card ${isWarming ? 'is-warming' : ''}`}><div className="scenario-card-head"><span>{isWarming ? 'PREPARING' : 'SCENE READY'}</span><Badge color={isWarming ? 'notice' : 'positive'} emphasis="subtle" size="small">{isWarming ? 'WARMING' : warmup?.cache_hit ? 'CACHED' : 'READY'}</Badge></div><strong>{scenario.short_label}</strong><p>{scenario.description}</p><small>Seed {scenario.seed} · {scenario.event_count.toLocaleString('en-IN')} cases · {scenario.attack_count} attacks</small></div>
+            <div className="numeric-grid"><TextInput label="Amount" type="number" prefix="₹" value={String(amount)} onChange={({ value }) => updateNumber(value, setAmount)} /><TextInput label="Case age" type="number" suffix="hours" value={String(caseAgeHours)} onChange={({ value }) => updateNumber(value, setCaseAgeHours)} /><TextInput label="Merchant budget" type="number" prefix="₹" value={String(merchantBudget)} onChange={({ value }) => updateNumber(value, setMerchantBudget)} /><TextInput label="Max incentive" type="number" suffix="%" helpText="Percentage ceiling of amount" value={String(maxIncentive)} onChange={({ value }) => updateNumber(value, setMaxIncentive)} /></div>
+            <div className="action-control"><div><Text size="small" weight="semibold">Allowed actions</Text><Text size="xsmall" color="surface.text.gray.muted">Merchant vetoes are enforced after model scoring.</Text></div><div className="checkbox-grid">{ACTION_OPTIONS.map((action) => <Checkbox key={action.value} value={action.value} isChecked={allowedActions.includes(action.value)} onChange={({ isChecked }) => toggleAction(action.value, isChecked)} size="small">{action.label}</Checkbox>)}</div></div>
+            <div className={`agent-toggle ${agentEnabled ? 'agent-on' : 'agent-off'}`}><div><Text size="small" weight="semibold">Selected single-run mode</Text><Text size="xsmall" color="surface.text.gray.muted">{agentEnabled ? 'ON · causal learner + integrity gate' : 'OFF · incumbent recovery stack'}</Text></div><Switch accessibilityLabel="Toggle recovery agent" isChecked={agentEnabled} onChange={({ isChecked }) => { setAgentEnabled(isChecked); if (comparisonReady) setApiResponse(isChecked ? pairedRuns.on ?? null : pairedRuns.off ?? null); else setApiResponse(null); setOfferApproved(false) }} /></div>
+            <div className={`agent-toggle auto-toggle ${autoExecuteEnabled && agentEnabled ? 'agent-on' : 'agent-off'}`}><div><Text size="small" weight="semibold">ON-AUTO execution</Text><Text size="xsmall" color="surface.text.gray.muted">{autoExecuteEnabled && agentEnabled ? 'Low-risk links execute automatically' : 'Manual approval is the default'}</Text></div><Switch accessibilityLabel="Toggle automatic low-risk execution" isChecked={autoExecuteEnabled && agentEnabled} isDisabled={!agentEnabled} onChange={({ isChecked }) => { setAutoExecuteEnabled(isChecked); resetEvidence() }} /></div>
+            <div className="control-actions"><Button variant="primary" size="large" icon={ZapIcon} isFullWidth isLoading={isPairLoading} isDisabled={isWarming || isLoading} onClick={handlePairedBenchmark}>Execute Paired Benchmark</Button><Button variant="secondary" size="medium" icon={SendIcon} isFullWidth isLoading={isLoading} isDisabled={isWarming || isPairLoading} onClick={handleInjectWebhook}>Run Selected Mode</Button></div></>}
+          <Button variant="tertiary" size="medium" icon={RefreshIcon} isFullWidth isLoading={isBatchUpdating} onClick={handleBatchLearning}>Trigger Batch Policy Update</Button>
           <div className="learning-status"><ActivityIcon size="small" color="surface.icon.gray.subtle" /><span>Learning loop</span><strong>{learningStep}</strong></div>
           {latestBatchRun && <div className={`batch-audit ${latestBatchRun.promoted ? 'promoted' : 'rollback'}`}><div><span>LAST PERSISTED BATCH RUN</span><Badge color={latestBatchRun.promoted ? 'positive' : 'negative'} emphasis="subtle" size="small">{latestBatchRun.run_status}</Badge></div><strong>{latestBatchRun.champion_model} → {latestBatchRun.challenger_model}</strong><p>ROI {latestBatchRun.incumbent_roi.toFixed(2)}x → {latestBatchRun.challenger_roi.toFixed(2)}x · quarantine {(latestBatchRun.quarantine_rate * 100).toFixed(0)}%</p>{latestBatchRun.rejection_reason && <small>{latestBatchRun.rejection_reason}</small>}<code>{latestBatchRun.run_id.slice(0, 18)}</code></div>}
         </div>
@@ -559,8 +606,8 @@ function RecoveryDashboard() {
       </aside>
 
       <main className="workspace-pane">
-        <header className="workspace-header"><div><Text size="xsmall" weight="semibold" color="surface.text.gray.muted">DECISION OPERATIONS / {scenario.short_label.toUpperCase()}</Text></div><div className="run-context"><span>{formatCurrency(amount)}</span><span><ClockIcon size="small" color="surface.icon.gray.subtle" /> {caseAgeHours}h old</span><Badge color={comparisonReady ? 'positive' : 'notice'} emphasis="subtle">{comparisonReady ? 'PAIR VERIFIED' : 'AWAITING RUN'}</Badge></div></header>
-        <div className="scenario-proof"><div><span>SCENE THESIS</span><strong>{scenario.primary_proof}</strong></div><div className="proof-prerequisites">{scenario.prerequisites.slice(0, 3).map((item) => <small key={item}>{item}</small>)}</div></div>
+        <header className="workspace-header"><div><Text size="xsmall" weight="semibold" color="surface.text.gray.muted">DECISION OPERATIONS / {usingLiveTelemetry ? 'LIVE RAZORPAY EVENT' : scenario.short_label.toUpperCase()}</Text></div><div className="run-context"><span>{formatCurrency(liveTelemetry?.amount ?? amount)}</span><span><ClockIcon size="small" color="surface.icon.gray.subtle" /> {usingLiveTelemetry ? 'live event' : `${caseAgeHours}h old`}</span><Badge color={usingLiveTelemetry || comparisonReady ? 'positive' : 'notice'} emphasis="subtle">{usingLiveTelemetry ? 'LIVE INPUT' : comparisonReady ? 'PAIR VERIFIED' : 'AWAITING RUN'}</Badge></div></header>
+        <div className="scenario-proof">{usingLiveTelemetry && liveTelemetry ? <div><span>LIVE TELEMETRY</span><strong>{humanize(liveTelemetry.error_reason)} from {humanize(liveTelemetry.error_source)}</strong></div> : <><div><span>SCENE THESIS</span><strong>{scenario.primary_proof}</strong></div><div className="proof-prerequisites">{scenario.prerequisites.slice(0, 3).map((item) => <small key={item}>{item}</small>)}</div></>}</div>
         <nav className="tab-rail" aria-label="Recovery dashboard views">{TABS.map((tab) => <Button key={tab.value} variant={activeTab === tab.value ? 'primary' : 'tertiary'} size="small" onClick={() => setActiveTab(tab.value)}>{tab.label}</Button>)}</nav>
         {errorMessage && <div className="alert-slot"><Alert title="Execution failed" description={errorMessage} color="negative" isFullWidth isDismissible onDismiss={() => setErrorMessage(null)} /></div>}
 

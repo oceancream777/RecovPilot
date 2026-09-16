@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
 from app.models import RecoveryCase
-
 
 RECOVERY_ACTIONS = {"no_action", "retry", "payment_link", "incentive_link", "message"}
 CONTACT_ACTIONS = {"payment_link", "incentive_link", "message"}
@@ -39,16 +39,10 @@ def _append_reason_code(context: dict[str, Any], reason_code: str) -> None:
         reason_codes.append(reason_code)
 
 
-def enforce_merchant_action_veto(
-    intended_action: str,
+def authorized_recovery_actions(
     merchant_constraints: Any,
-) -> str:
-    """Apply the merchant's final action veto after every fallback path.
-
-    ``no_action`` and ``suppress`` are safe terminal states, not merchant-facing
-    recovery interventions. Every executable recovery action must appear in the
-    merchant-provided allowed-actions list.
-    """
+    candidate_actions: Iterable[str] | None = None,
+) -> set[str]:
     constraints = (
         merchant_constraints.model_dump()
         if hasattr(merchant_constraints, "model_dump")
@@ -56,11 +50,34 @@ def enforce_merchant_action_veto(
         if isinstance(merchant_constraints, dict)
         else {}
     )
+    allowed = {str(action) for action in constraints.get("allowed_actions", [])}
+    candidates = (
+        {str(action) for action in candidate_actions}
+        if candidate_actions is not None
+        else allowed
+    )
+    return (allowed & candidates & RECOVERY_ACTIONS) | {"no_action"}
+
+
+def enforce_merchant_action_veto(
+    intended_action: str,
+    merchant_constraints: Any,
+    candidate_actions: Iterable[str] | None = None,
+) -> str:
+    """Apply the merchant's final action veto after every fallback path.
+
+    ``no_action`` and ``suppress`` are safe terminal states, not merchant-facing
+    recovery interventions. Every executable recovery action must appear in the
+    merchant-provided allowed-actions list.
+    """
     action = str(intended_action)
     if action in {"no_action", "suppress"}:
         return action
-    allowed_actions = set(constraints.get("allowed_actions", []))
-    return action if action in allowed_actions else "no_action"
+    authorized = authorized_recovery_actions(
+        merchant_constraints,
+        candidate_actions,
+    )
+    return action if action in authorized else "no_action"
 
 
 def apply_policy_guard(

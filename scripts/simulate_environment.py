@@ -154,6 +154,19 @@ def action_channel(action: str) -> str:
     }[action]
 
 
+def failure_telemetry(failure_class: str) -> tuple[str, str, str]:
+    return {
+        "insufficient_funds": (
+            "BAD_REQUEST_ERROR",
+            "bank",
+            "insufficient_balance",
+        ),
+        "issuer_down": ("SERVER_ERROR", "bank", "bank_offline"),
+        "network_timeout": ("GATEWAY_ERROR", "gateway", "payment_timed_out"),
+        "user_cancelled": ("BAD_REQUEST_ERROR", "customer", "incorrect_otp"),
+    }[failure_class]
+
+
 def make_clean_records(
     index: int,
     segment: str,
@@ -168,6 +181,8 @@ def make_clean_records(
     amount = round(rng.uniform(amount_low, amount_high), 2)
     paid = rng.random() < PAY_PROBABILITY[segment][action]
 
+    failure_class = rng.choice(FAILURE_CLASSES[segment])
+    error_code, error_source, error_reason = failure_telemetry(failure_class)
     case = RecoveryCase(
         case_id=case_id,
         merchant_id=f"merchant_{rng.randint(1, 50):03d}",
@@ -177,7 +192,10 @@ def make_clean_records(
         case_age_hours=round(rng.uniform(0.0, 96.0), 2),
         attempt_count=rng.randint(1, 4 if segment == "subscription_churn" else 3),
         payment_method=rng.choices(["card", "upi"], weights=[72, 28], k=1)[0],
-        failure_class=rng.choice(FAILURE_CLASSES[segment]),
+        error_code=error_code,
+        error_source=error_source,
+        error_reason=error_reason,
+        failure_class=failure_class,
         customer_segment=segment,
         event_time=event_time,
     )
@@ -254,6 +272,9 @@ def make_attack_records(
         case_age_hours=72.0,
         attempt_count=15,
         payment_method="card",
+        error_code="NO_ATTEMPT",
+        error_source="NO_ATTEMPT",
+        error_reason="NO_ATTEMPT",
         failure_class="user_cancelled",
         customer_segment="price_sensitive",
         event_time=event_time,
