@@ -73,7 +73,7 @@ graph TD
 
 ### Request path
 
-1. The React/Vite simulator loads one of five deterministic scenarios or accepts live merchant inputs.
+1. The React/Vite simulator loads one of five deterministic scenarios in demo mode. Verified live webhooks bypass manual scenario selection.
 2. `POST /api/v1/execute/demo_toggle` compares the configured baseline path with the causal-agent path while preserving the same case context.
 3. The integrity layer evaluates velocity, identity/IP concentration, reward-farming patterns, and downstream-quality mismatch.
 4. Trusted cases reach the T-Learner. Quarantined cases receive a safe action and are excluded from training.
@@ -84,6 +84,8 @@ graph TD
 
 - **FastAPI backend:** Typed intake, decision, execution, approval, policy-administration, webhook, and health endpoints.
 - **React/Vite frontend:** Scenario controls, paired OFF/ON execution, HITL approval, causal metrics, and comparative results.
+- **Hybrid intent router:** Exact Razorpay failure reasons take a local constant-time path; unseen reasons use a mockable, strictly typed classifier contract.
+- **Specialized recovery agents:** `IncentiveAgent` owns causal offer decisions, while `SmartRetryAgent` isolates deterministic zero-cost infrastructure retries.
 - **EconML and Scikit-Learn:** An EconML `TLearner` with a `GradientBoostingClassifier(max_depth=4)` probability adapter for each available action arm, including `no_action` as control.
 - **SQLite and SQLAlchemy:** Recovery cases, assignments, interventions, outcomes, integrity signals, audit logs, policy versions, and batch-policy runs.
 - **Persisted telemetry state:** The latest verified live webhook timestamp and a non-PII event snapshot are stored in SQLite for restart-safe live/demo routing.
@@ -115,7 +117,12 @@ flowchart LR
     E --> F[Read-only amount, method, and Razorpay failure telemetry]
     G[Razorpay signed webhook] --> H[POST /api/v1/webhooks/razorpay]
     H --> I[Verify signature and persist non-PII receipt state]
-    I --> B
+    I --> J{Known error reason?}
+    J -->|Exact match| K[Fast deterministic route]
+    J -->|Unseen| L[Structured classifier fallback]
+    K --> M[Specialized recovery agent]
+    L --> M
+    M --> B
     B -->|No event for configured timeout| C
 ```
 
@@ -125,6 +132,16 @@ The default inactivity timeout is 300 seconds. Configure it with `RAZORPAY_LIVE_
 
 Live merchant constraints are read from backend environment variables. Demo requests send their merchant budget, maximum incentive percentage, recovery window, offer ladder, and allowed actions directly from the React controls. This keeps customer-originated live fields read-only while retaining interactive policy testing in demo mode.
 
+### Autonomous live routing
+
+The live listener routes behavioral reasons such as `payment_cancelled`, `customer_abandoned`, and `general_decline` to `IncentiveAgent`. That agent asks the existing EconML learner for incremental treatment effect, then passes the result through the existing merchant, grace-window, regulatory, and execution-risk controls. Capital deficits, authentication errors, method limits, and infrastructure failures route to `SmartRetryAgent`. This includes `insufficient_funds`, `incorrect_otp`, `otp_expired`, `transaction_limit_exceeded`, `bank_downtime`, `gateway_error`, and `payment_timed_out`. Smart Retry does not invoke EconML and never spends incentive budget.
+
+An unseen reason enters a constrained classification contract. The classifier prepares the context and Pydantic JSON schema once, scores only the permitted `incentive` and `smart_retry` labels, converts those logits to probabilities with softmax, and selects the highest-probability label. Pydantic constructs the response, so the router never asks a model to autoregressively generate JSON. The repository ships a deterministic local logit backend; a transformer decoder can replace that backend later without changing the router or sub-agent contracts.
+
+The classifier's only authority is selecting a sub-agent. It cannot set a discount, generate a payment link, change an allowed action, or bypass guardrails. The design follows the deterministic-first and specialist-routing principles discussed in [Intent Detection in the Age of LLMs](https://arxiv.org/abs/2410.01627) and [Toward Super Agent System with Hybrid AI Routers](https://arxiv.org/abs/2504.10519).
+
+Every autonomous result includes `router_path`, `router_intent`, `router_confidence`, the selected agent, final action, expected lift, and deterministic reason codes. FastAPI persists the financial decision to `audit_logs` and appends a non-PII `autonomous_routing_decision` record to the JSONL telemetry stream.
+
 ## Cold-Start Training
 
 Fresh clones do not contain the ignored JSONL log or Joblib binary. Use the dedicated seeder when you want a trained V2 artifact without waiting for real attributed outcomes:
@@ -133,7 +150,7 @@ Fresh clones do not contain the ignored JSONL log or Joblib binary. Use the dedi
 python scripts/seed_and_train.py
 ```
 
-The utility creates the `data/` directory when necessary, appends 500 `CLOSED` and `TRUSTED` telemetry records, and trains the existing DuckDB/EconML pipeline. Its controlled signal is 70% treatment recovery versus 20% control recovery for `insufficient_funds`, and 0% recovery for both arms under `bank_downtime`. The resulting artifact is written atomically to `app/artifacts/causal_models.joblib`.
+The utility creates the `data/` directory when necessary, appends 500 `CLOSED` and `TRUSTED` telemetry records, and trains the existing DuckDB/EconML pipeline. Its controlled signal is 70% treatment recovery versus 20% control recovery for `payment_cancelled`, equal 20% recovery in both arms for `insufficient_funds`, and 0% recovery in both arms for `bank_downtime`. This teaches behavioral lift without treating a capital deficit or an outage as discount-responsive. The resulting artifact is written atomically to `app/artifacts/causal_models.joblib`.
 
 For an isolated demo dataset, avoid mixing synthetic labels with live history:
 
@@ -615,6 +632,10 @@ npm run build
 
 ```text
 recovery-learning-agent/
+|-- agents/
+|   |-- orchestrator.py          # Route, execute, and emit audit output
+|   |-- router.py                # Deterministic-first hybrid intent router
+|   `-- subagents.py             # Incentive and zero-cost retry agents
 |-- app/
 |   |-- baseline_policy.py       # Agent-OFF policy path
 |   |-- database.py              # SQLite engine and sessions
@@ -632,7 +653,7 @@ recovery-learning-agent/
 |-- frontend/                    # React/Vite dashboard
 |-- scripts/
 |   |-- run_benchmark.py
-|   |-- seed_and_train.py       # Cold-start JSONL seeder and artifact trainer
+|   |-- seed_and_train.py        # Cold-start JSONL seeder and artifact trainer
 |   |-- simulate_environment.py  # SQLite cases and attack harness
 |   `-- test_model.py            # Local model inspection utility
 |-- tests/                       # API, policy, persistence, and safety tests

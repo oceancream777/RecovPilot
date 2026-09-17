@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from app import learner
 from app.intake import normalize_recovery_event
 from app.schemas import RecoveryCaseRead
 from app.webhook_log import append_webhook_payload
+from scripts.seed_and_train import build_seed_records
 
 
 def _attributed_rows() -> list[dict]:
@@ -54,6 +56,27 @@ def _attributed_rows() -> list[dict]:
     rows[0]["merchant_budget"] = None
     rows[1]["error_reason"] = None
     return rows
+
+
+def test_cold_start_data_teaches_behavioral_lift_not_capital_deficit_lift() -> None:
+    records = build_seed_records(random.Random(2026))
+
+    def recovery_rate(reason: str, treatment: int) -> float:
+        cohort = [
+            row
+            for row in records
+            if row["error_reason"] == reason
+            and row["treatment_applied"] == treatment
+        ]
+        return sum(int(row["is_recovered"]) for row in cohort) / len(cohort)
+
+    assert len(records) == 500
+    assert recovery_rate("payment_cancelled", 1) == pytest.approx(0.70)
+    assert recovery_rate("payment_cancelled", 0) == pytest.approx(0.20)
+    assert recovery_rate("insufficient_funds", 1) == pytest.approx(0.20)
+    assert recovery_rate("insufficient_funds", 0) == pytest.approx(0.20)
+    assert recovery_rate("bank_downtime", 1) == 0.0
+    assert recovery_rate("bank_downtime", 0) == 0.0
 
 
 def test_recovery_case_and_abandonment_default_to_no_attempt() -> None:

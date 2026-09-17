@@ -188,6 +188,10 @@ No recent verified payment.failed webhook
 Signed Razorpay payment.failed webhook received
 -> Signature verified by FastAPI
 -> Amount and failure telemetry persisted as a non-PII live snapshot
+-> Known error_reason uses the deterministic fast router
+-> Unseen error_reason uses the structured classifier stub
+-> IncentiveAgent or SmartRetryAgent executes its isolated decision contract
+-> Decision is persisted to audit_logs and the JSONL audit stream
 -> LIVE mode
 -> Read-only amount, payment method, error code, source, and reason
 
@@ -209,6 +213,8 @@ https://<your-ngrok-domain>/api/v1/webhooks/razorpay
 
 The generic `/api/v1/intake/webhook` route does not activate live mode. This prevents unsigned synthetic or browser requests from being treated as real Razorpay telemetry. Live merchant constraints are read from backend environment variables; demo merchant constraints are sent from the React controls.
 
+The structured fallback is local and deterministic in this repository. No LLM API key is required. It scores only the schema-approved agent labels and lets Pydantic construct valid JSON; there is no token-by-token JSON generation. It classifies intent only, while merchant action vetoes, the grace window, incentive limits, regulatory checks, and HITL circuit breakers remain authoritative downstream.
+
 ## Cold-Start Training
 
 The repository intentionally ignores the local JSONL log and Joblib model artifact. To create a learned model on a fresh clone, run:
@@ -217,7 +223,7 @@ The repository intentionally ignores the local JSONL log and Joblib model artifa
 python scripts/seed_and_train.py
 ```
 
-This appends 500 closed, trusted records to `data/webhooks_log.jsonl`, then trains and saves `app/artifacts/causal_models.joblib`. The generated data teaches the causal engine that discounts help insufficient-funds failures but do not help bank downtime failures.
+This appends 500 closed, trusted records to `data/webhooks_log.jsonl`, then trains and saves `app/artifacts/causal_models.joblib`. The generated data teaches the causal engine that discounts can lift behavioral cancellation, while `insufficient_funds` has no discount lift and bank downtime has no recovery in either arm.
 
 For an isolated demo log and artifact, use separate paths:
 

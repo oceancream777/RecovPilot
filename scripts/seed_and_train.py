@@ -64,28 +64,37 @@ def _outcomes(
 
 def build_seed_records(rng: random.Random) -> list[dict[str, object]]:
     """Create 500 CLOSED, TRUSTED control/treatment outcomes with known ITEs."""
-    insufficient_funds = _outcomes(
-        rng,
-        treatment_count=150,
-        control_count=150,
-        treatment_recoveries=105,
-        control_recoveries=30,
-    )
-    bank_downtime = _outcomes(
+    payment_cancelled = _outcomes(
         rng,
         treatment_count=100,
         control_count=100,
+        treatment_recoveries=70,
+        control_recoveries=20,
+    )
+    insufficient_funds = _outcomes(
+        rng,
+        treatment_count=75,
+        control_count=75,
+        treatment_recoveries=15,
+        control_recoveries=15,
+    )
+    bank_downtime = _outcomes(
+        rng,
+        treatment_count=75,
+        control_count=75,
         treatment_recoveries=0,
         control_recoveries=0,
     )
 
     records: list[dict[str, object]] = []
     for reason, outcomes in (
+        ("payment_cancelled", payment_cancelled),
         ("insufficient_funds", insufficient_funds),
         ("bank_downtime", bank_downtime),
     ):
         for treatment_applied, is_recovered in outcomes:
             bank_failure = reason == "bank_downtime"
+            behavioral_failure = reason == "payment_cancelled"
             records.append(
                 {
                     "record_type": "cold_start_attributed_outcome",
@@ -93,11 +102,19 @@ def build_seed_records(rng: random.Random) -> list[dict[str, object]]:
                     "amount": round(rng.uniform(500.0, 12_000.0), 2),
                     "case_age_hours": round(rng.uniform(48.0, 96.0), 2),
                     "merchant_budget": round(rng.uniform(10_000.0, 50_000.0), 2),
-                    "error_code": "SERVER_ERROR" if bank_failure else "BAD_REQUEST_ERROR",
-                    "error_source": "bank",
+                    "error_code": "GATEWAY_ERROR" if bank_failure else "BAD_REQUEST_ERROR",
+                    "error_source": "customer" if behavioral_failure else "issuer_bank",
                     "error_reason": reason,
-                    "failure_class": "issuer_down" if bank_failure else "insufficient_funds",
-                    "customer_segment": "high_intent_repeat" if bank_failure else "price_sensitive",
+                    "failure_class": (
+                        "issuer_down"
+                        if bank_failure
+                        else "user_cancelled"
+                        if behavioral_failure
+                        else "insufficient_funds"
+                    ),
+                    "customer_segment": (
+                        "price_sensitive" if behavioral_failure else "high_intent_repeat"
+                    ),
                     "treatment_applied": treatment_applied,
                     "is_recovered": is_recovered,
                     "action": "incentive_link" if treatment_applied else "no_action",
@@ -146,7 +163,8 @@ def main() -> int:
     records = build_seed_records(random.Random(args.seed))
     asyncio.run(append_records(records, log_path))
     print(f"Seeded {len(records)} records into {log_path}")
-    print("Signal: insufficient funds 70% treated vs 20% control")
+    print("Signal: payment cancelled 70% treated vs 20% control")
+    print("Signal: insufficient funds 20% for treatment and control")
     print("Signal: bank downtime 0% recovered for treatment and control")
 
     from app.learner import train_t_learner_from_jsonl
